@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ATOMIC FRAMEWORK - CORS Module
+CORS Misconfiguration detection
+"""
+
+from urllib.parse import urlparse
+
+
+from config import Colors
+from modules.base import BaseModule
+
+
+class CORSModule(BaseModule):
+    """CORS Testing Module"""
+
+    name = "CORS Misconfiguration"
+    vuln_type = "cors"
+
+    def __init__(self, engine):
+        super().__init__(engine)
+
+    def test(self, url: str, method: str, param: str, value: str):
+        """Test for CORS misconfiguration"""
+        pass  # CORS is tested at URL level
+
+    def test_url(self, url: str):
+        """Test URL for CORS misconfiguration.
+
+        Iterates through every malicious origin class so that a single
+        permissive response does not mask additional weaknesses (null,
+        file://, subdomain takeover patterns, etc.). Each origin produces
+        at most one finding for this URL via ``_seen`` so reports stay
+        readable.
+        """
+        # Test with malicious origin
+        malicious_origins = [
+            "https://evil.com",
+            "http://evil.com",
+            "https://attacker.com",
+            "null",
+            "file://",
+            "http://localhost",
+            "http://127.0.0.1",
+            "https://" + urlparse(url).netloc + ".evil.com",
+        ]
+
+        seen_findings = set()  # (technique, severity) per-URL dedup
+
+        def _record(technique: str, severity: str, confidence: float, origin: str, evidence: str):
+            key = (technique, severity)
+            if key in seen_findings:
+                return
+            seen_findings.add(key)
+            from core.engine import Finding
+
+            finding = Finding(
+                technique=technique,
+                url=url,
+                severity=severity,
+                confidence=confidence,
+                param="",
+                payload="Origin: " + origin,
+                evidence=evidence,
+            )
+            self.engine.add_finding(finding)
+
+        for origin in malicious_origins:
+            try:
+                headers = {"Origin": origin}
+                response = self.requester.request(url, "GET", headers=headers)
+
+                if not response:
+                    continue
+
+                acao = response.headers.get("Access-Control-Allow-Origin", "")
+                acac = response.headers.get("Access-Control-Allow-Credentials", "")
+                response.headers.get("Access-Control-Allow-Methods", "")
+
+                # Check for misconfigurations
+                if acao == "*":
+                    # Wildcard ACAO is only a real issue if credentials are also allowed
+                    # Public APIs intentionally use ACAO:* which is safe without credentials
+                    if acac.lower() == "true":
+                        _record(
+                            "CORS Misconfiguration (Wildcard + Credentials)",
+                            "HIGH",
+                            0.9,
+                            origin,
+                            "Access-Control-Allow-Origin: *\nAccess-Control-Allow-Credentials: true",
+                        )
+                    else:
+                        # Wildcard without credentials is informational, not a vulnerability
+                        _record(
+                            "CORS Misconfiguration (Wildcard)",
+                            "INFO",
+                            0.5,
+                            origin,
+                            "Access-Control-Allow-Origin: * (no credentials)",
+                        )
+                    continue  # next origin — wildcard observed, no point retrying same class
+
+                if acao == origin:
+                    if acac.lower() == "true":
+                        _record(
+                            "CORS Misconfiguration (Credentials)",
+                            "HIGH",
+                            0.9,
+                            origin,
+                            f"Access-Control-Allow-Origin: {acao}\nAccess-Control-Allow-Credentials: true",
+                        )
+                    else:
+                        _record(
+                            "CORS Misconfiguration (Reflected Origin)",
+                            "MEDIUM",
+                            0.7,
+                            origin,
+                            f"Access-Control-Allow-Origin: {acao}",
+                        )
+
+            except Exception as e:
+                if self.engine.config.get("verbose"):
+                    print(f"{Colors.error(f'CORS test error: {e}')}")
+
+    def test_preflight(self, url: str):
+        """Test CORS preflight response"""
+        try:
+            headers = {
+                "Origin": "https://evil.com",
+                "Access-Control-Request-Method": "DELETE",
+                "Access-Control-Request-Headers": "X-Custom-Header",
+            }
+
+            response = self.requester.request(url, "OPTIONS", headers=headers)
+
+            if response:
+                acam = response.headers.get("Access-Control-Allow-Methods", "")
+
+                if "DELETE" in acam or "PUT" in acam or "PATCH" in acam:
+                    from core.engine import Finding
+
+                    finding = Finding(
+                        technique="CORS Misconfiguration (Dangerous Methods)",
+                        url=url,
+                        severity="MEDIUM",
+                        confidence=0.7,
+                        param="",
+                        payload="OPTIONS request",
+                        evidence=f"Dangerous methods allowed: {acam}",
+                    )
+                    self.engine.add_finding(finding)
+
+        except Exception as e:
+            if self.engine.config.get("verbose"):
+                print(f"{Colors.error(f'CORS preflight test error: {e}')}")

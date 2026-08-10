@@ -1,0 +1,42 @@
+*.pyc
+__pycache__/
+*.db
+reports/
+shells/
+logs/
+wordlists/
+*.egg-info/
+dist/
+build/
+.atomic_learning.json
+.atomic_ai_data.json
+.atomic_progress.json
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment & secrets
+.env
+.env.*
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# mypy cache
+.mypy_cache/
+
+# GitHub wordlist cache (fetched at runtime)
+.github_wordlist_cache/

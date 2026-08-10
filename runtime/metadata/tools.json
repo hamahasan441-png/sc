@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "tools": {
+    "subfinder": {"version": "artifact-required", "binary": "subfinder", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "amass": {"version": "artifact-required", "binary": "amass", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "dnsx": {"version": "artifact-required", "binary": "dnsx", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "httpx": {"version": "artifact-required", "binary": "httpx", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "naabu": {"version": "artifact-required", "binary": "naabu", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "katana": {"version": "artifact-required", "binary": "katana", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "ffuf": {"version": "artifact-required", "binary": "ffuf", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "nuclei": {"version": "artifact-required", "binary": "nuclei", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "interactsh-client": {"version": "artifact-required", "binary": "interactsh-client", "platforms": ["linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-arm64"]},
+    "nmap": {"version": "artifact-required", "binary": "nmap"},
+    "nikto": {"version": "artifact-required", "binary": "nikto"},
+    "whatweb": {"version": "artifact-required", "binary": "whatweb"}
+  }
+}
