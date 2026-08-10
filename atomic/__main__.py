@@ -13,9 +13,10 @@ Run ``python -m atomic --help`` to see the help text.
 from __future__ import annotations
 import argparse
 import os
+import re
 import subprocess
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import __version__
 from .profiles import PROFILES, get, to_main_args
@@ -136,8 +137,186 @@ def cmd_lab(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_update(_: argparse.Namespace) -> int:
-    return subprocess.call([sys.executable, "main.py", "--update"])
+def _detect_update_target() -> tuple[str, str] | None:
+    """Return (repo, branch) for the current source tree, or None.
+
+    Reads ``git remote get-url origin`` and ``git rev-parse --abbrev-ref HEAD``
+    so the wrapper always updates from the repo the operator actually
+    cloned — not from the framework's hard-coded default
+    (``hamahasan441-png/Scanner-``) which points at a different
+    repository.
+
+    Returns ``None`` if not a git checkout, so the caller can fall back
+    to the main.py updater.
+    """
+    try:
+        # base_dir = the parent of the atomic/ package, which is the
+        # repo root for a normal source checkout.
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        url_proc = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=base, capture_output=True, text=True, timeout=5,
+        )
+        if url_proc.returncode != 0 or not url_proc.stdout.strip():
+            return None
+        url = url_proc.stdout.strip()
+
+        branch_proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=base, capture_output=True, text=True, timeout=5,
+        )
+        if branch_proc.returncode != 0 or not branch_proc.stdout.strip():
+            return None
+        branch = branch_proc.stdout.strip()
+
+        # Normalise various remote URL forms to a "owner/repo" slug so
+        # the framework's UPDATE_REPO env var (consumed by core.updater)
+        # accepts it.
+        #   https://github.com/owner/repo.git       → owner/repo
+        #   https://github.com/owner/repo           → owner/repo
+        #   git@github.com:owner/repo.git           → owner/repo
+        #   ssh://git@github.com/owner/repo.git     → owner/repo
+        m = re.search(r"[:/]([^/]+/[^/]+?)(?:\.git)?/?$", url)
+        if not m:
+            return None
+        return (m.group(1), branch)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git_run(args, cwd, timeout=10):
+    """Run a git command; return CompletedProcess or None on failure."""
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _check_via_git(repo_slug: str, branch: str, base: str) -> Tuple[int, str]:
+    """Compare local HEAD with the remote branch head using only git.
+
+    Returns (rc, message). This is the fallback used when
+    core.updater cannot be imported (e.g. PyYAML missing in a lean
+    environment). It uses the same 'git ls-remote' / 'git rev-parse'
+    approach as core.updater so the answer is identical.
+    """
+    rc_remote = _git_run(
+        ["ls-remote", "origin", f"refs/heads/{branch}"], cwd=base, timeout=10,
+    )
+    if not rc_remote or rc_remote.returncode != 0 or not rc_remote.stdout.strip():
+        return 2, f"could not reach origin for {repo_slug}@{branch}"
+    remote_sha = rc_remote.stdout.split()[0]
+
+    rc_local = _git_run(["rev-parse", "HEAD"], cwd=base, timeout=5)
+    if not rc_local or rc_local.returncode != 0:
+        return 2, "could not read local HEAD"
+    local_sha = rc_local.stdout.strip()
+
+    if remote_sha == local_sha:
+        return 0, f"Already up to date (HEAD = {local_sha[:8]})."
+    return 1, (f"Update available: origin/{branch} is at {remote_sha[:8]}; "
+               f"local HEAD is {local_sha[:8]}.\n"
+               f"Run: atomic update")
+
+
+def cmd_check_update(args: argparse.Namespace) -> int:
+    """Print whether an update is available, without applying it."""
+    repo = args.repo
+    branch = args.branch
+    if not repo or not branch:
+        detected = _detect_update_target()
+        if detected is None:
+            print(
+                "[!] Not a git checkout — cannot check for updates.",
+                file=sys.stderr,
+            )
+            return 2
+        detected_repo, detected_branch = detected
+        repo = repo or detected_repo
+        branch = branch or detected_branch
+
+    print(f"  repo    : {repo}")
+    print(f"  branch  : {branch}")
+
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # First try the framework's own updater. It does the same work but
+    # also handles non-git installs (GitHub releases).
+    env = os.environ.copy()
+    env["ATOMIC_UPDATE_REPO"] = repo
+    env["ATOMIC_UPDATE_BRANCH"] = branch
+    env["ATOMIC_NO_UPDATE_CHECK"] = "1"
+    try:
+        from core.updater import check_for_update
+        status = check_for_update()
+        print(f"  current : {status.current}")
+        if status.latest:
+            print(f"  latest  : {status.latest}")
+        print(f"  method  : {status.method}")
+        if status.error:
+            print(f"  error   : {status.error}")
+        if status.detail:
+            print(f"  detail  : {status.detail}")
+        if status.available:
+            print("[!] An update is available. Run: atomic update")
+            return 1
+        print("[i] Already up to date.")
+        return 0
+    except (BaseException,) as exc:
+        # core.updater pulls in core.engine → PyYAML etc. Fall back
+        # to a pure-git comparison so the wrapper still works in
+        # lean environments (this is exactly what the user asked
+        # for: a direct update-from-my-repo flow).
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        print(f"  fallback: pure-git comparison (core.updater unavailable: "
+              f"{type(exc).__name__})")
+        rc, msg = _check_via_git(repo, branch, base)
+        print(f"  {msg}")
+        return rc
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    env = os.environ.copy()
+
+    # Resolve the repo / branch to update from.
+    repo = args.repo
+    branch = args.branch
+    if not repo or not branch:
+        detected = _detect_update_target()
+        if detected is None:
+            print(
+                "[!] Not a git checkout — falling back to 'main.py --update'.",
+                file=sys.stderr,
+            )
+            return subprocess.call(
+                [sys.executable, "main.py", "--update"],
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            )
+        detected_repo, detected_branch = detected
+        repo = repo or detected_repo
+        branch = branch or detected_branch
+        print(f"[i] Detected repo from git remote: {repo}")
+        print(f"[i] Detected branch from git HEAD: {branch}")
+
+    # Make sure the framework's own updater hits the right endpoint,
+    # not the hard-coded default of "hamahasan441-png/Scanner-".
+    env["ATOMIC_UPDATE_REPO"] = repo
+    env["ATOMIC_UPDATE_BRANCH"] = branch
+    # Avoid the throttled "update available" notice path; the user
+    # explicitly asked for an update.
+    env["ATOMIC_NO_UPDATE_CHECK"] = "1"
+    # Don't apply a startup auto-update that would re-exec ourselves.
+    env["ATOMIC_AUTO_UPDATE"] = "0"
+
+    print(f"[i] Updating from {repo}@{branch} ...")
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return subprocess.call(
+        [sys.executable, "main.py", "--update", *(["--force"] if args.force else [])],
+        cwd=base, env=env,
+    )
 
 
 def cmd_version(_: argparse.Namespace) -> int:
@@ -160,6 +339,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  atomic scan https://example.com --profile quick\n"
             "  atomic scan https://example.com --profile full --authorized --yes\n"
             "  atomic dashboard --host 127.0.0.1 --port 5000\n"
+            "  atomic update          # update from current git remote\n"
+            "  atomic check-update    # show whether an update is available\n"
             "  atomic lab\n"
             "  atomic version\n"
         ),
@@ -197,8 +378,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_lab = sub.add_parser("lab", help="Print instructions for a local test target.")
     p_lab.set_defaults(func=cmd_lab)
 
-    p_upd = sub.add_parser("update", help="Update to the latest version.")
+    p_upd = sub.add_parser(
+        "update",
+        help=(
+            "Update the framework from the current git remote. "
+            "By default detects the repo and branch from "
+            "'git remote get-url origin' and "
+            "'git rev-parse --abbrev-ref HEAD'."
+        ),
+    )
+    p_upd.add_argument(
+        "--repo", default=None,
+        help=(
+            "Override the source repo (default: derived from "
+            "'git remote get-url origin'). Accepts 'owner/repo' or a "
+            "full URL."
+        ),
+    )
+    p_upd.add_argument(
+        "--branch", default=None,
+        help=(
+            "Override the source branch (default: current git HEAD). "
+            "Ignored when --repo is also a full URL."
+        ),
+    )
+    p_upd.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Overwrite local changes during a git fast-forward update. "
+            "Required when the working tree is dirty."
+        ),
+    )
     p_upd.set_defaults(func=cmd_update)
+
+    p_chk = sub.add_parser(
+        "check-update",
+        help=(
+            "Check whether an update is available, without applying it. "
+            "Reads the same 'git remote get-url origin' as 'atomic update'."
+        ),
+    )
+    p_chk.add_argument("--repo", default=None, help="Override the source repo.")
+    p_chk.add_argument("--branch", default=None, help="Override the source branch.")
+    p_chk.set_defaults(func=cmd_check_update)
 
     p_ver = sub.add_parser("version", help="Print version info.")
     p_ver.set_defaults(func=cmd_version)

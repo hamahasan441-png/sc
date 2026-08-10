@@ -246,6 +246,74 @@ class TestAuthorizationHelper(unittest.TestCase):
         self.assertFalse(self._authz.is_authorized())
 
 
+class TestDetectUpdateTarget(unittest.TestCase):
+    """The atomic.update flow must use the current git remote, not a hard-coded default."""
+
+    def _det(self):
+        # Load the function as a method of the real atomic.__main__ module
+        # so the relative imports inside the module resolve correctly.
+        from atomic.__main__ import _detect_update_target
+        return _detect_update_target()
+
+    def test_returns_none_when_not_a_git_repo(self):
+        # /tmp is not a git checkout → returns None.
+        with mock.patch("subprocess.run") as mrun:
+            mrun.return_value = subprocess.CompletedProcess(
+                args=[], returncode=128, stdout="", stderr="not a git repo",
+            )
+            self.assertIsNone(self._det())
+
+    def test_parses_https_url(self):
+        fake_remote = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="https://github.com/foo/bar.git\n", stderr="",
+        )
+        fake_branch = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="main\n", stderr="",
+        )
+        with mock.patch("subprocess.run", side_effect=[fake_remote, fake_branch]):
+            self.assertEqual(self._det(), ("foo/bar", "main"))
+
+    def test_parses_https_url_without_dot_git(self):
+        fake_remote = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="https://github.com/foo/bar\n", stderr="",
+        )
+        fake_branch = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="develop\n", stderr="",
+        )
+        with mock.patch("subprocess.run", side_effect=[fake_remote, fake_branch]):
+            self.assertEqual(self._det(), ("foo/bar", "develop"))
+
+    def test_parses_ssh_url(self):
+        fake_remote = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="git@github.com:foo/bar.git\n", stderr="",
+        )
+        fake_branch = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="main\n", stderr="",
+        )
+        with mock.patch("subprocess.run", side_effect=[fake_remote, fake_branch]):
+            self.assertEqual(self._det(), ("foo/bar", "main"))
+
+    def test_parses_ssh_protocol_url(self):
+        fake_remote = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="ssh://git@github.com/foo/bar.git\n", stderr="",
+        )
+        fake_branch = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="main\n", stderr="",
+        )
+        with mock.patch("subprocess.run", side_effect=[fake_remote, fake_branch]):
+            self.assertEqual(self._det(), ("foo/bar", "main"))
+
+    def test_real_repo(self):
+        """Sanity: the test environment itself is a git checkout, so
+        we should detect 'hamahasan441-png/sc' from the real origin."""
+        result = self._det()
+        if result is None:
+            self.skipTest("not a git checkout in this environment")
+        self.assertEqual(result[0], "hamahasan441-png/sc")
+        self.assertEqual(result[1], "arena/019fed7a-sc")
+
+
 class TestAtomicWrapperCLIParsing(unittest.TestCase):
     def test_scan_help(self):
         result = subprocess.run(
