@@ -189,14 +189,135 @@ class ScopePolicy:
 
     @staticmethod
     def _normalize_hostname(hostname: str) -> str:
-        """Canonicalize a DNS hostname for safe scope comparisons."""
+        """Canonicalize a DNS hostname for safe scope comparisons.
+
+        Handles:
+        - Trailing dot stripping
+        - Lowercasing
+        - IDNA encoding
+        - IPv4 alternative notations (decimal, hex, octal) → dotted decimal
+        - IPv4-mapped IPv6 → IPv4
+        """
         value = (hostname or "").strip().rstrip(".").lower()
         if not value:
             return ""
+        # Remove IPv6 brackets if present
+        if value.startswith("[") and value.endswith("]"):
+            value = value[1:-1]
+
+        # Attempt IP normalization for alternative notations
+        normalized_ip = ScopePolicy._normalize_ip_alternative(value)
+        if normalized_ip:
+            return normalized_ip
+
         try:
             return value.encode("idna").decode("ascii")
         except UnicodeError:
             return ""
+
+    @staticmethod
+    def _normalize_ip_alternative(host: str) -> str:
+        """Normalize alternative IP representations to canonical dotted IPv4 or compressed IPv6.
+
+        Supports:
+        - Decimal: 2130706433 → 127.0.0.1
+        - Hex: 0x7f.0.0.1, 0x7f000001
+        - Octal: 0177.0.0.1, 0o177.0.0.1
+        - Mixed: 0x7f.0.0.0x1
+        - IPv4-mapped IPv6: ::ffff:127.0.0.1 → 127.0.0.1
+        Returns normalized string or '' if not an IP.
+        """
+        import ipaddress
+        h = (host or "").strip().lower()
+        if not h:
+            return ""
+
+        # Handle IPv4-mapped IPv6 like ::ffff:127.0.0.1 or 0:0:0:0:0:ffff:127.0.0.1
+        try:
+            # If it contains ':' and '.' it's likely mapped
+            if ":" in h and "." in h:
+                # Try to parse as IPv6, then extract mapped IPv4
+                ip6 = ipaddress.ip_address(h)
+                if isinstance(ip6, ipaddress.IPv6Address) and ip6.ipv4_mapped:
+                    return str(ip6.ipv4_mapped)
+                # Also check for ::ffff:x.x.x.x manual form
+                # ipaddress already handles, but fallback
+        except ValueError:
+            pass
+
+        # Pure decimal IPv4 (single number)
+        if h.isdigit():
+            try:
+                num = int(h)
+                # 32-bit unsigned
+                if 0 <= num <= 0xFFFFFFFF:
+                    return str(ipaddress.IPv4Address(num))
+            except (ValueError, ipaddress.AddressValueError):
+                pass
+
+        # Hex single number like 0x7f000001
+        if h.startswith("0x"):
+            try:
+                # Could be like 0x7f000001
+                num = int(h, 16)
+                if 0 <= num <= 0xFFFFFFFF:
+                    return str(ipaddress.IPv4Address(num))
+            except ValueError:
+                pass
+
+        # Try to parse as IPv4 with parts that may be octal/hex
+        # Split by '.'
+        if "." in h:
+            parts = h.split(".")
+            # If 4 parts, try to normalize each part that may be octal/hex
+            if 1 <= len(parts) <= 4:
+                normalized_parts = []
+                for p in parts:
+                    if not p:
+                        return ""
+                    try:
+                        # Handle hex: 0x7f
+                        if p.lower().startswith("0x"):
+                            val = int(p, 16)
+                        # Handle octal: leading 0 and all digits 0-7, e.g., 0177
+                        elif p.startswith("0") and len(p) > 1 and p[1:].isdigit() and all(c in "01234567" for c in p):
+                            val = int(p, 8)
+                        elif p.isdigit():
+                            val = int(p)
+                        else:
+                            # Not a numeric part, may be hostname — abort IP normalization
+                            normalized_parts = None
+                            break
+                        if not 0 <= val <= 255:
+                            # If we have less than 4 parts, larger values may be allowed in last part?
+                            # For simplicity, reject >255 unless it's the last part of a <4 part address
+                            # which ipaddress module can handle.
+                            # Try ipaddress fallback.
+                            normalized_parts = None
+                            break
+                        normalized_parts.append(str(val))
+                    except ValueError:
+                        normalized_parts = None
+                        break
+                if normalized_parts is not None and len(normalized_parts) == len(parts):
+                    candidate = ".".join(normalized_parts)
+                    try:
+                        return str(ipaddress.IPv4Address(candidate))
+                    except ValueError:
+                        pass
+
+        # Fallback: try ipaddress direct parsing for standard IPv4/IPv6
+        try:
+            ip = ipaddress.ip_address(h)
+            # Normalize IPv4 to dotted decimal, IPv6 to compressed
+            if isinstance(ip, ipaddress.IPv4Address):
+                return str(ip)
+            # For IPv6, return compressed lowercase
+            return ip.compressed.lower()
+        except ValueError:
+            pass
+
+        return ""
 
     def _domain_allowed(self, domain):
         """Check whether a hostname is exactly allowed or a true subdomain.

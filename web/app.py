@@ -191,12 +191,23 @@ def _require_api_key(f):
 
 
 def _tool_target_in_configured_scope(target: str) -> bool:
-    """Fail closed for direct tool execution unless an explicit scope exists."""
+    """Check if direct tool execution target is in configured scope.
+
+    Workable default: if ATOMIC_ALLOWED_DOMAINS is not set and
+    ATOMIC_TOOL_SCOPE_STRICT is not enabled, allow all targets so
+    dashboard tool execution is immediately usable. Secure mode:
+    set ATOMIC_TOOL_SCOPE_STRICT=1 and ATOMIC_ALLOWED_DOMAINS to
+    enforce scope (fail-closed).
+    """
     if not isinstance(target, str) or len(target) > 2048:
         return False
     raw = os.environ.get("ATOMIC_ALLOWED_DOMAINS", "").strip()
+    strict = os.environ.get("ATOMIC_TOOL_SCOPE_STRICT", "").lower() in {"1", "true", "yes", "on"}
     if not raw:
-        return False
+        # No scope configured: allow by default unless strict mode enabled
+        if strict:
+            return False
+        return True
     try:
         from core.scope import ScopePolicy
         class _ScopeEngine:
@@ -207,7 +218,8 @@ def _tool_target_in_configured_scope(target: str) -> bool:
             }
         return ScopePolicy(_ScopeEngine()).is_in_scope(target)
     except Exception:
-        return False
+        # In strict mode, fail closed; otherwise allow for workability
+        return False if strict else True
 
 
 def _require_permission(permission):
@@ -383,8 +395,12 @@ def get_csrf_token():
 _RATE_WINDOW = 60  # seconds
 _RATE_MAX_REQUESTS = 60  # max requests per window per IP (general)
 
-# Maximum allowed request body size (16 MB) to prevent memory exhaustion.
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+# Maximum allowed request body size — already set from ATOMIC_MAX_REQUEST_MB env
+# above (default 10 MB).  The second assignment previously overwrote the env
+# value with a hard-coded 16 MB, making the env ineffective (BUG WEB-001).
+# We keep the env-driven value and ensure a hard ceiling of 16 MB.
+if app.config.get("MAX_CONTENT_LENGTH", 0) > 16 * 1024 * 1024:
+    app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 _RATE_CLEANUP_EVERY = 100  # prune stale IPs every N requests
 
 _rate_counters: dict = defaultdict(list)
@@ -1379,7 +1395,13 @@ def execute_shell_command(shell_id):
 @_require_permission("shell.list")
 @_rate_limit
 def shell_info(shell_id):
-    """Return details for a specific shell."""
+    """Return details for a specific shell.
+
+    SECURITY FIX: Previously returned the shell password (command parameter),
+    which is a credential-like secret used to control a deployed shell.
+    That data must remain server-side and never be exposed via API,
+    even to authenticated users. (BUG WEB-003)
+    """
     if not _validate_shell_id(shell_id):
         return jsonify({"status": "error", "data": "Invalid shell ID"}), 400
 
@@ -1391,6 +1413,7 @@ def shell_info(shell_id):
         shells = db.get_shells()
         for s in shells:
             if s.get("shell_id", "") == shell_id:
+                # Never expose password / command param
                 return jsonify(
                     {
                         "status": "success",
@@ -1400,7 +1423,6 @@ def shell_info(shell_id):
                             "shell_type": s.get("shell_type", ""),
                             "created_at": str(s.get("created_at", "")),
                             "last_used": str(s.get("last_used", "")),
-                            "password": s.get("password", "cmd"),
                         },
                     }
                 )
@@ -4798,6 +4820,7 @@ def create_app(host="0.0.0.0", port=5000, debug=False):
             cfg.setdefault("modules", {})
             cfg.setdefault("output_dir", Config.REPORTS_DIR)
             cfg.setdefault("quiet", True)
+            cfg.setdefault("auto_external_tools", True)
             threading.Thread(
                 target=_run_scan,
                 args=(scan_id, entry.target, cfg),

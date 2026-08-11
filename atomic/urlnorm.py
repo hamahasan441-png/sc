@@ -130,6 +130,23 @@ def normalize(target: str, *, default_scheme: Optional[str] = None) -> str:
     host = parsed.hostname or ""
     if not host:
         raise ValueError(f"target {raw!r} has no hostname")
+
+    # SECURITY: Reject single-label hostnames without dot (e.g., "not-a-url")
+    # unless they are localhost, private, or numeric IP (decimal/hex)
+    # This prevents ambiguous inputs from being treated as valid targets and
+    # matches the expectation of tests that "not-a-url" should be rejected.
+    # We allow:
+    # - localhost and *.localhost, *.local
+    # - RFC1918, loopback, link-local
+    # - Pure numeric (decimal IP like 2130706433) or hex (0x7f000001)
+    # - Hosts containing dot (example.com) or colon (IPv6)
+    if "." not in host and ":" not in host:
+        # Check if it's numeric or hex IP representation
+        is_numeric_ip = host.isdigit() or (host.lower().startswith("0x") and all(c in "0123456789abcdef" for c in host.lower()[2:]))
+        if not (is_numeric_ip or _is_private_or_localhost(host)):
+            # Also allow if host is exactly "localhost" handled by _is_private_or_localhost, so this is truly single-label public
+            raise ValueError(f"target {raw!r} is not a valid hostname (single-label without dot)")
+
     scheme = (default_scheme or _default_scheme(host)).lower()
     if scheme not in ("http", "https"):
         scheme = "https"

@@ -22,6 +22,17 @@ from core.tool_integrator import (
     _run_command,
 )
 
+# SECURITY FIX: Enable host tools for unit tests (production defaults fail-closed)
+os.environ["ATOMIC_ALLOW_HOST_TOOLS"] = "1"
+# Re-initialize runtime to pick up env change
+try:
+    from core import tool_runtime as _tr
+    _tr.RUNTIME.allow_host_tools = True
+    _tr.RUNTIME.require_bundled = False
+except Exception:
+    pass
+
+
 
 class TestToolResult(unittest.TestCase):
     """Test ToolResult dataclass."""
@@ -72,7 +83,7 @@ class TestNmapAdapter(unittest.TestCase):
         self.adapter = NmapAdapter()
 
     def test_not_available_returns_error(self):
-        with patch("shutil.which", return_value=None):
+        with patch("shutil.which", return_value=None), patch("core.tool_runtime.resolve_tool", return_value=None), patch("core.tool_integrator.resolve_tool", return_value=None):
             adapter = NmapAdapter()
             self.assertFalse(adapter.is_available())
             result = adapter.run("example.com")
@@ -146,7 +157,7 @@ class TestNucleiAdapter(unittest.TestCase):
         self.adapter = NucleiAdapter()
 
     def test_not_available(self):
-        with patch("shutil.which", return_value=None):
+        with patch("shutil.which", return_value=None), patch("core.tool_runtime.resolve_tool", return_value=None), patch("core.tool_integrator.resolve_tool", return_value=None):
             result = self.adapter.run("https://example.com")
             self.assertFalse(result.success)
 
@@ -173,7 +184,7 @@ class TestNiktoAdapter(unittest.TestCase):
         self.adapter = NiktoAdapter()
 
     def test_not_available(self):
-        with patch("shutil.which", return_value=None):
+        with patch("shutil.which", return_value=None), patch("core.tool_runtime.resolve_tool", return_value=None), patch("core.tool_integrator.resolve_tool", return_value=None):
             result = self.adapter.run("https://example.com")
             self.assertFalse(result.success)
 
@@ -200,7 +211,7 @@ class TestWhatWebAdapter(unittest.TestCase):
         self.adapter = WhatWebAdapter()
 
     def test_not_available(self):
-        with patch("shutil.which", return_value=None):
+        with patch("shutil.which", return_value=None), patch("core.tool_runtime.resolve_tool", return_value=None), patch("core.tool_integrator.resolve_tool", return_value=None):
             result = self.adapter.run("https://example.com")
             self.assertFalse(result.success)
 
@@ -236,7 +247,7 @@ class TestSubfinderAdapter(unittest.TestCase):
         self.adapter = SubfinderAdapter()
 
     def test_not_available(self):
-        with patch("shutil.which", return_value=None):
+        with patch("shutil.which", return_value=None), patch("core.tool_runtime.resolve_tool", return_value=None), patch("core.tool_integrator.resolve_tool", return_value=None):
             result = self.adapter.run("example.com")
             self.assertFalse(result.success)
 
@@ -294,7 +305,7 @@ class TestHttpxAdapter(unittest.TestCase):
         self.adapter = HttpxAdapter()
 
     def test_not_available(self):
-        with patch("shutil.which", return_value=None):
+        with patch("shutil.which", return_value=None), patch("core.tool_runtime.resolve_tool", return_value=None), patch("core.tool_integrator.resolve_tool", return_value=None):
             adapter = HttpxAdapter()
             self.assertFalse(adapter.is_available())
             result = adapter.run("https://example.com")
@@ -337,7 +348,7 @@ class TestFfufAdapter(unittest.TestCase):
         self.adapter = FfufAdapter()
 
     def test_not_available(self):
-        with patch("shutil.which", return_value=None):
+        with patch("shutil.which", return_value=None), patch("core.tool_runtime.resolve_tool", return_value=None), patch("core.tool_integrator.resolve_tool", return_value=None):
             adapter = FfufAdapter()
             self.assertFalse(adapter.is_available())
             result = adapter.run("https://example.com/FUZZ")

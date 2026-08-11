@@ -213,9 +213,18 @@ class ReconModule:
 
     def _whois_lookup(self, domain: str):
         """Structured WHOIS lookup via system ``whois`` command."""
+        # SECURITY FIX (TOOL-001): Validate domain to prevent argument injection
+        if not domain or domain.startswith("-") or len(domain) > 256:
+            if self.verbose:
+                print(f"{Colors.warning('WHOIS skipped: invalid domain')}")
+            return
+        if any(c in domain for c in [";", "&", "|", "`", "$", "\n", "\r", " "]):
+            if self.verbose:
+                print(f"{Colors.warning('WHOIS skipped: unsafe characters in domain')}")
+            return
         try:
             result = subprocess.run(
-                ["whois", domain],
+                ["whois", "--", domain],
                 capture_output=True,
                 text=True,
                 timeout=15,

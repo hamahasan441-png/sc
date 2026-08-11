@@ -311,7 +311,8 @@ class TestDetectUpdateTarget(unittest.TestCase):
         if result is None:
             self.skipTest("not a git checkout in this environment")
         self.assertEqual(result[0], "hamahasan441-png/sc")
-        self.assertEqual(result[1], "arena/019fed7a-sc")
+        # Branch name varies per session (arena/<id>-sc), so accept any arena/*
+        self.assertTrue(result[1].startswith("arena/"), f"Expected arena/* branch, got {result[1]}")
 
 
 class TestAtomicWrapperCLIParsing(unittest.TestCase):

@@ -549,7 +549,14 @@ class AtomicEngine:
         }
 
     def _run_external_tools_auto(self, target: str):
-        """Run integrated external tools automatically when enabled."""
+        """Run integrated external tools automatically when enabled and convert
+        their results into canonical findings so the framework actually uses them
+        in jobs, tasks, reports, and attack planning.
+
+        Tools run: whatweb, httpx, nikto, nuclei, nmap, plus recon arsenal
+        (subfinder, amass, katana, etc) when available. Results are turned
+        into Findings.
+        """
         if not self.config.get("auto_external_tools", False):
             return
         if not self.tools:
@@ -572,7 +579,65 @@ class AtomicEngine:
             if self.config.get("verbose"):
                 print(f"{Colors.warning(f'External vuln suite error: {exc}')}")
 
+        # Also run full recon arsenal if available (subdomain, crawler, etc)
+        if getattr(self, "recon_arsenal", None):
+            try:
+                arsenal_results = self.recon_arsenal.run_full_recon(target, domain=domain)
+                all_results.update(arsenal_results)
+            except Exception as exc:
+                if self.config.get("verbose"):
+                    print(f"{Colors.warning(f'Recon arsenal error: {exc}')}")
+
         if all_results:
+            # Convert tool findings into engine findings so framework uses them
+            converted = 0
+            for tool_name, res in all_results.items():
+                if not getattr(res, "success", False):
+                    continue
+                for f in getattr(res, "findings", []) or []:
+                    try:
+                        # Normalize tool finding dict to engine Finding
+                        if isinstance(f, dict):
+                            technique = f.get("type") or f.get("template_id") or f.get("technology") or f.get("subdomain") or tool_name
+                            # Build meaningful technique label
+                            if tool_name == "nuclei" and f.get("name"):
+                                technique = f"External Tool (Nuclei: {f.get('name')})"
+                            elif tool_name == "nmap" and f.get("type") == "open_port":
+                                technique = f"External Tool (Nmap: Open Port {f.get('port')}/{f.get('protocol')})"
+                            elif tool_name in ("subfinder", "amass") and f.get("subdomain"):
+                                technique = f"External Tool ({tool_name}: Subdomain {f.get('subdomain')})"
+                            elif f.get("url"):
+                                technique = f"External Tool ({tool_name}: {f.get('url')[:60]})"
+                            else:
+                                technique = f"External Tool ({tool_name}: {technique})"
+
+                            evidence = f.get("details") or f.get("msg") or f.get("description") or str(f)[:500]
+                            url = f.get("url") or f.get("host") or f.get("matched_at") or target
+
+                            # Severity mapping
+                            sev = "INFO"
+                            if tool_name == "nuclei":
+                                raw_sev = (f.get("severity") or "").upper()
+                                if raw_sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+                                    sev = raw_sev
+                            elif tool_name == "nmap" and f.get("type") == "vulnerability":
+                                sev = "HIGH"
+                            elif tool_name in ("nikto",):
+                                sev = "MEDIUM"
+
+                            finding = Finding(
+                                technique=technique,
+                                url=url,
+                                severity=sev,
+                                confidence=0.85 if tool_name in ("nuclei", "nmap") else 0.70,
+                                evidence=evidence[:500],
+                                extracted_data=str(f)[:1000],
+                            )
+                            self.add_finding(finding)
+                            converted += 1
+                    except Exception:
+                        continue
+
             results = [res for res in all_results.values() if hasattr(res, "success")]
             self.emit_pipeline_event(
                 "external_tools_completed",
@@ -580,8 +645,11 @@ class AtomicEngine:
                     "tools": list(all_results.keys()),
                     "success_count": sum(1 for r in results if r.success),
                     "failure_count": sum(1 for r in results if not r.success),
+                    "findings_converted": converted,
                 },
             )
+            if self.config.get("verbose"):
+                print(f"{Colors.info(f'External tools: {converted} findings converted from {len(all_results)} tools')}")
 
     def scan(self, target: str):
         """Scan a target URL.
