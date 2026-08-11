@@ -383,8 +383,12 @@ def get_csrf_token():
 _RATE_WINDOW = 60  # seconds
 _RATE_MAX_REQUESTS = 60  # max requests per window per IP (general)
 
-# Maximum allowed request body size (16 MB) to prevent memory exhaustion.
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+# Maximum allowed request body size — already set from ATOMIC_MAX_REQUEST_MB env
+# above (default 10 MB).  The second assignment previously overwrote the env
+# value with a hard-coded 16 MB, making the env ineffective (BUG WEB-001).
+# We keep the env-driven value and ensure a hard ceiling of 16 MB.
+if app.config.get("MAX_CONTENT_LENGTH", 0) > 16 * 1024 * 1024:
+    app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 _RATE_CLEANUP_EVERY = 100  # prune stale IPs every N requests
 
 _rate_counters: dict = defaultdict(list)
@@ -1379,7 +1383,13 @@ def execute_shell_command(shell_id):
 @_require_permission("shell.list")
 @_rate_limit
 def shell_info(shell_id):
-    """Return details for a specific shell."""
+    """Return details for a specific shell.
+
+    SECURITY FIX: Previously returned the shell password (command parameter),
+    which is a credential-like secret used to control a deployed shell.
+    That data must remain server-side and never be exposed via API,
+    even to authenticated users. (BUG WEB-003)
+    """
     if not _validate_shell_id(shell_id):
         return jsonify({"status": "error", "data": "Invalid shell ID"}), 400
 
@@ -1391,6 +1401,7 @@ def shell_info(shell_id):
         shells = db.get_shells()
         for s in shells:
             if s.get("shell_id", "") == shell_id:
+                # Never expose password / command param
                 return jsonify(
                     {
                         "status": "success",
@@ -1400,7 +1411,6 @@ def shell_info(shell_id):
                             "shell_type": s.get("shell_type", ""),
                             "created_at": str(s.get("created_at", "")),
                             "last_used": str(s.get("last_used", "")),
-                            "password": s.get("password", "cmd"),
                         },
                     }
                 )

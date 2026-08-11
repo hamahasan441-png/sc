@@ -22,6 +22,17 @@ from core.tool_integrator import (
     _run_command,
 )
 
+# SECURITY FIX: Enable host tools for unit tests (production defaults fail-closed)
+os.environ["ATOMIC_ALLOW_HOST_TOOLS"] = "1"
+# Re-initialize runtime to pick up env change
+try:
+    from core import tool_runtime as _tr
+    _tr.RUNTIME.allow_host_tools = True
+    _tr.RUNTIME.require_bundled = False
+except Exception:
+    pass
+
+
 
 class TestToolResult(unittest.TestCase):
     """Test ToolResult dataclass."""
