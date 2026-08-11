@@ -576,6 +576,8 @@ def main():
     parser.add_argument("--check-deps", action="store_true", help="Check dependencies")
     parser.add_argument("--tools-status", action="store_true", help="Show managed security-tool runtime status and exit")
     parser.add_argument("--tools-doctor", action="store_true", help="Validate managed security-tool runtime and exit")
+    parser.add_argument("--make-portable", action="store_true", help="Copy host-installed security tools to runtime/bin and make them portable with SHA256 verification")
+    parser.add_argument("--portable-tools", nargs="*", default=None, help="Specific tools to make portable (default: all found host tools)")
     parser.add_argument("--update", action="store_true", help="Update framework to the latest version from the GitHub repo")
     parser.add_argument("--clear-db", action="store_true", help="Clear database")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -979,12 +981,29 @@ def main():
         args.url = _maybe_normalize(args.url, "url")
 
     # Managed tool runtime diagnostics are independent of the web stack.
-    if getattr(args, "tools_status", False) or getattr(args, "tools_doctor", False):
+    if getattr(args, "tools_status", False) or getattr(args, "tools_doctor", False) or getattr(args, "make_portable", False):
         from core.tool_runtime import RUNTIME
-        status = RUNTIME.status()
+        if getattr(args, "make_portable", False):
+            # Make host tools portable: copy to runtime/bin with SHA256
+            tools_list = getattr(args, "portable_tools", None)
+            if tools_list == []:
+                tools_list = None  # --portable-tools without args = all
+            print(f"{Colors.info('Making host tools portable...')}")
+            results = RUNTIME.make_portable(tools=tools_list)
+            for name, info in results.items():
+                if info.get("success"):
+                    print(f"  {Colors.GREEN}[✓]{Colors.RESET} {name:20s} -> {info.get('bundled_path')} (sha256:{info.get('sha256','')[:12]}...)")
+                else:
+                    print(f"  {Colors.RED}[✗]{Colors.RESET} {name:20s} {info.get('error','')}")
+            print(f"\n{Colors.success('Portable runtime updated: runtime/metadata/tools.json')}")
+            status = RUNTIME.status()
+        else:
+            status = RUNTIME.status()
         for name, info in status.items():
             marker = "✓" if info["available"] and info["integrity"] == "verified" else ("~" if info["available"] else "✗")
-            print(f"{marker} {name:20s} {info['source']:8s} {info['integrity']}")
+            src = info.get("source","")
+            integ = info.get("integrity","")
+            print(f"{marker} {name:20s} {src:12s} {integ:20s} {info.get('bundled_path','') or info.get('host_path','')}")
         if getattr(args, "tools_doctor", False):
             broken = [n for n, i in status.items() if not i["available"]]
             if broken:

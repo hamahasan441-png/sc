@@ -312,10 +312,21 @@ def _has_pip() -> bool:
 
 
 def _is_tool_installed(tool_name: str) -> bool:
-    """Check if a tool binary is available in PATH."""
+    """Check if a tool binary is available in PATH or runtime/bin."""
     info = TOOL_REGISTRY.get(tool_name)
     binary = info.binary_name if info else tool_name
-    return shutil.which(binary) is not None
+    # Check PATH
+    if shutil.which(binary):
+        return True
+    # Check portable runtime bin (runtime/bin/<tool>)
+    try:
+        from pathlib import Path
+        runtime_bin = Path(__file__).resolve().parents[1] / "runtime" / "bin" / binary
+        if runtime_bin.is_file() and os.access(runtime_bin, os.X_OK):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def get_install_command(tool_name: str) -> Optional[str]:

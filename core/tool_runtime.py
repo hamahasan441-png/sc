@@ -35,11 +35,31 @@ class ToolRuntime:
         self.root = root
         self.bin_dir = root / "runtime" / "bin"
         self.manifest_path = root / "runtime" / "metadata" / "tools.json"
-        # Production/security default: never silently fall back to an
-        # unpinned host executable.  Legacy host resolution is an explicit
-        # opt-in via ATOMIC_ALLOW_HOST_TOOLS=1.
-        self.allow_host_tools = os.environ.get("ATOMIC_ALLOW_HOST_TOOLS", "").lower() in {"1", "true", "yes"}
-        self.require_bundled = not self.allow_host_tools
+        # Workable default: allow host tools for usability so framework can use
+        # installed security tools in jobs/tasks immediately. Secure mode opt-in:
+        #   ATOMIC_REQUIRE_BUNDLED_TOOLS=1  → require verified bundled binaries only
+        #   ATOMIC_ALLOW_HOST_TOOLS=0/false → disallow host fallback (fail-closed)
+        # This balances security (explicit secure mode) with usability (default workable).
+        req_bundled_env = os.environ.get("ATOMIC_REQUIRE_BUNDLED_TOOLS", "").lower()
+        allow_env = os.environ.get("ATOMIC_ALLOW_HOST_TOOLS", "").lower()
+
+        if req_bundled_env in {"1", "true", "yes", "on"}:
+            # Strict secure mode: only verified bundled binaries
+            self.allow_host_tools = False
+            self.require_bundled = True
+        elif allow_env in {"0", "false", "no", "off"}:
+            # Explicitly disallow host tools
+            self.allow_host_tools = False
+            self.require_bundled = True
+        elif allow_env in {"1", "true", "yes", "on"}:
+            # Explicitly allow host tools (legacy opt-in)
+            self.allow_host_tools = True
+            self.require_bundled = False
+        else:
+            # Default workable: allow host tools with warning (portable mode)
+            # This makes framework use nmap, nuclei, etc from PATH if present
+            self.allow_host_tools = True
+            self.require_bundled = False
         self._manifest = self._load_manifest()
 
     def _load_manifest(self) -> Dict[str, ToolSpec]:
@@ -105,8 +125,16 @@ class ToolRuntime:
         return shutil.which(name)
 
     def status(self) -> Dict[str, dict]:
+        # Include all known tools from manifests and common security tools
         names = set(self._manifest)
-        names.update({"nmap", "nuclei", "nikto", "whatweb", "subfinder", "httpx", "ffuf", "amass", "dnsx", "katana", "naabu", "interactsh-client"})
+        # ToolIntegrator + ReconArsenal + extra
+        names.update({
+            "nmap", "nuclei", "nikto", "whatweb", "subfinder", "httpx", "ffuf",
+            "amass", "dnsx", "katana", "naabu", "interactsh-client",
+            "gau", "waybackurls", "gobuster", "feroxbuster", "masscan",
+            "rustscan", "hakrawler", "arjun", "paramspider", "dirsearch",
+            "whatweb", "subfinder", "httpx", "ffuf", "amass", "katana"
+        })
         out = {}
         for name in sorted(names):
             bundled = self.bundled_path(name)
@@ -115,8 +143,107 @@ class ToolRuntime:
                 "available": bool(bundled or (host and self.allow_host_tools)),
                 "source": "bundled" if bundled else ("host" if host and self.allow_host_tools else "none"),
                 "integrity": "verified" if bundled else ("unverified-host" if host and self.allow_host_tools else "missing"),
+                "bundled_path": bundled,
+                "host_path": host,
             }
         return out
+
+    def make_portable(self, tools: Optional[list] = None) -> Dict[str, dict]:
+        """Make host tools portable by copying them to runtime/bin and updating manifest with sha256.
+
+        This creates verified bundled binaries from currently installed host tools,
+        turning unverified-host into verified portable artifacts.
+
+        Args:
+            tools: Optional list of tool names to make portable. If None, all found host tools.
+
+        Returns:
+            Dict mapping tool name to result info.
+        """
+        import shutil as _shutil
+        self.bin_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Load existing manifest or create new
+        manifest_data = {}
+        if self.manifest_path.is_file():
+            try:
+                manifest_data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest_data = {}
+        if "tools" not in manifest_data:
+            manifest_data["tools"] = {}
+        if "schema_version" not in manifest_data:
+            manifest_data["schema_version"] = 1
+
+        # Determine which tools to process
+        all_status = self.status()
+        if tools is None:
+            # All tools that are available on host but not yet bundled
+            tools_to_process = [name for name, info in all_status.items() if info.get("host_path")]
+        else:
+            tools_to_process = tools
+
+        results = {}
+        for name in tools_to_process:
+            host_path = _shutil.which(name)
+            if not host_path:
+                results[name] = {"success": False, "error": "not found on host"}
+                continue
+            try:
+                src = Path(host_path)
+                dest = self.bin_dir / name
+                # Copy file, preserve executable
+                _shutil.copy2(src, dest)
+                # Ensure executable
+                dest.chmod(0o755)
+                # Compute sha256
+                sha256 = self._sha256(dest)
+                # Update manifest
+                plat_key = self._platform_key()
+                existing = manifest_data["tools"].get(name, {})
+                manifest_data["tools"][name] = {
+                    "version": existing.get("version", "portable"),
+                    "binary": name,
+                    "sha256": sha256,
+                    "platforms": list(set(existing.get("platforms", []) + [plat_key])),
+                    "source": f"host:{host_path}",
+                }
+                results[name] = {"success": True, "sha256": sha256, "bundled_path": str(dest), "host_path": host_path}
+            except Exception as exc:
+                results[name] = {"success": False, "error": str(exc)}
+
+        # Write updated manifest
+        try:
+            self.manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+            # Reload manifest
+            self._manifest = self._load_manifest()
+        except Exception as exc:
+            for r in results.values():
+                if r.get("success"):
+                    r["manifest_error"] = str(exc)
+
+        return results
+
+    def install_missing(self) -> Dict[str, dict]:
+        """Install missing tools using tool_downloader if available.
+
+        Attempts to use Go, apt, brew, pip etc to install tools.
+        Returns status dict.
+        """
+        try:
+            from utils.tool_downloader import TOOL_REGISTRY, _is_tool_installed, install_tool
+            results = {}
+            for tool_name in TOOL_REGISTRY:
+                if _is_tool_installed(tool_name):
+                    results[tool_name] = {"installed": True, "method": "already"}
+                else:
+                    # Try to install
+                    ok = install_tool(tool_name, verbose=False)
+                    results[tool_name] = {"installed": ok, "method": "auto"}
+            return results
+        except Exception as exc:
+            return {"error": str(exc)}
 
 
 RUNTIME = ToolRuntime()

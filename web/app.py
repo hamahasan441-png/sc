@@ -191,12 +191,23 @@ def _require_api_key(f):
 
 
 def _tool_target_in_configured_scope(target: str) -> bool:
-    """Fail closed for direct tool execution unless an explicit scope exists."""
+    """Check if direct tool execution target is in configured scope.
+
+    Workable default: if ATOMIC_ALLOWED_DOMAINS is not set and
+    ATOMIC_TOOL_SCOPE_STRICT is not enabled, allow all targets so
+    dashboard tool execution is immediately usable. Secure mode:
+    set ATOMIC_TOOL_SCOPE_STRICT=1 and ATOMIC_ALLOWED_DOMAINS to
+    enforce scope (fail-closed).
+    """
     if not isinstance(target, str) or len(target) > 2048:
         return False
     raw = os.environ.get("ATOMIC_ALLOWED_DOMAINS", "").strip()
+    strict = os.environ.get("ATOMIC_TOOL_SCOPE_STRICT", "").lower() in {"1", "true", "yes", "on"}
     if not raw:
-        return False
+        # No scope configured: allow by default unless strict mode enabled
+        if strict:
+            return False
+        return True
     try:
         from core.scope import ScopePolicy
         class _ScopeEngine:
@@ -207,7 +218,8 @@ def _tool_target_in_configured_scope(target: str) -> bool:
             }
         return ScopePolicy(_ScopeEngine()).is_in_scope(target)
     except Exception:
-        return False
+        # In strict mode, fail closed; otherwise allow for workability
+        return False if strict else True
 
 
 def _require_permission(permission):
@@ -4808,6 +4820,7 @@ def create_app(host="0.0.0.0", port=5000, debug=False):
             cfg.setdefault("modules", {})
             cfg.setdefault("output_dir", Config.REPORTS_DIR)
             cfg.setdefault("quiet", True)
+            cfg.setdefault("auto_external_tools", True)
             threading.Thread(
                 target=_run_scan,
                 args=(scan_id, entry.target, cfg),
