@@ -140,31 +140,31 @@ class ConnectionPoolManager:
         if self._session is not None:
             return self._session
 
-        try:
-            import requests as _requests
-            from requests.adapters import HTTPAdapter as _HTTPAdapter
-            from requests.packages.urllib3.util.retry import Retry as _Retry
-
-            session = _requests.Session()
-            retry_strategy = _Retry(
-                total=self._max_retries,
-                backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504],
-            )
-            adapter = _HTTPAdapter(
-                max_retries=retry_strategy,
-                pool_connections=self._pool_connections,
-                pool_maxsize=self._pool_maxsize,
-            )
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-            self._session = session
-            return session
-        except ImportError:
+        # ``requests`` is imported at module import time (see the top of this
+        # module), so a missing dependency surfaces at startup via
+        # ``REQUESTS_AVAILABLE`` rather than appearing lazily on the first
+        # call.  Fail fast with a clear error instead of trying a late import.
+        if not REQUESTS_AVAILABLE:
             raise RuntimeError(
                 "requests library is not installed. "
                 "Install with: pip install requests"
-            ) from None
+            )
+
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=self._max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=self._pool_connections,
+            pool_maxsize=self._pool_maxsize,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        self._session = session
+        return session
 
     def close(self) -> None:
         """Close the managed session and release pooled connections."""
