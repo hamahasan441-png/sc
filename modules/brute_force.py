@@ -266,7 +266,7 @@ class BruteForceModule:
                 password,
                 static_fields,
             )
-            if not resp:
+            if resp is None:
                 continue
 
             resp_lower = resp.text.lower()

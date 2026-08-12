@@ -265,13 +265,16 @@ class ScopePolicy:
             except ValueError:
                 pass
 
-        # Try to parse as IPv4 with parts that may be octal/hex
-        # Split by '.'
+        # Try to parse as IPv4 with parts that may be octal/hex, including
+        # the BSD inet_aton shortened forms (SEC-008):
+        #   1 part : full 32-bit value            (handled above)
+        #   2 parts: 8 bits + 24 bits             ("127.1"      -> 127.0.0.1)
+        #   3 parts: 8 + 8 + 16 bits              ("127.0.1"    -> 127.0.0.1)
+        #   4 parts: 8 bits each                  ("0x7f.0.0.1" -> 127.0.0.1)
         if "." in h:
             parts = h.split(".")
-            # If 4 parts, try to normalize each part that may be octal/hex
             if 1 <= len(parts) <= 4:
-                normalized_parts = []
+                values = []
                 for p in parts:
                     if not p:
                         return ""
@@ -286,25 +289,19 @@ class ScopePolicy:
                             val = int(p)
                         else:
                             # Not a numeric part, may be hostname — abort IP normalization
-                            normalized_parts = None
+                            values = None
                             break
-                        if not 0 <= val <= 255:
-                            # If we have less than 4 parts, larger values may be allowed in last part?
-                            # For simplicity, reject >255 unless it's the last part of a <4 part address
-                            # which ipaddress module can handle.
-                            # Try ipaddress fallback.
-                            normalized_parts = None
+                        if val < 0:
+                            values = None
                             break
-                        normalized_parts.append(str(val))
+                        values.append(val)
                     except ValueError:
-                        normalized_parts = None
+                        values = None
                         break
-                if normalized_parts is not None and len(normalized_parts) == len(parts):
-                    candidate = ".".join(normalized_parts)
-                    try:
-                        return str(ipaddress.IPv4Address(candidate))
-                    except ValueError:
-                        pass
+                if values is not None and len(values) == len(parts):
+                    reduced = ScopePolicy._reduce_short_ipv4(values)
+                    if reduced:
+                        return reduced
 
         # Fallback: try ipaddress direct parsing for standard IPv4/IPv6
         try:
@@ -317,6 +314,39 @@ class ScopePolicy:
         except ValueError:
             pass
 
+        return ""
+
+    @staticmethod
+    def _reduce_short_ipv4(values: list) -> str:
+        """Reduce 1-4 numeric octets (BSD inet_aton semantics) to dotted IPv4.
+
+        Returns the canonical dotted-decimal string or "" when the values
+        cannot represent an IPv4 address.
+        """
+        import ipaddress
+
+        n = len(values)
+        if n == 4:
+            if any(v > 0xFF for v in values):
+                return ""
+            try:
+                return str(ipaddress.IPv4Address(".".join(str(v) for v in values)))
+            except ValueError:
+                return ""
+        if 1 <= n <= 3:
+            # The final part spans the remaining low-order bytes.
+            trailing_bits = 8 * (4 - n + 1)
+            max_last = (1 << trailing_bits) - 1
+            if values[-1] > max_last or any(v > 0xFF for v in values[:-1]):
+                return ""
+            num = 0
+            for v in values[:-1]:
+                num = (num << 8) | v
+            num = (num << trailing_bits) | values[-1]
+            try:
+                return str(ipaddress.IPv4Address(num))
+            except ValueError:
+                return ""
         return ""
 
     def _domain_allowed(self, domain):

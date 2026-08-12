@@ -27,6 +27,26 @@ class ToolSpec:
     sha256: str = ""
     binary: str = ""
     platforms: tuple[str, ...] = ()
+    # Manifest provenance.  ``portable_wrapper`` marks the bundled
+    # *simulation* stubs (runtime/bin wrappers emitting canned output),
+    # which must never be treated as real security tools by default.
+    source: str = ""
+
+
+def simulated_tools_allowed() -> bool:
+    """SEC-013: simulation stubs are opt-in.
+
+    The bundled ``portable_wrapper`` artifacts fabricate tool output
+    (fake open ports, fake nuclei hits).  They are disabled by default so
+    scans never report fabricated data as real; set
+    ``ATOMIC_ALLOW_SIMULATED_TOOLS=1`` to enable them (demo/offline mode).
+    """
+    return os.environ.get("ATOMIC_ALLOW_SIMULATED_TOOLS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class ToolRuntime:
@@ -79,8 +99,28 @@ class ToolRuntime:
                 sha256=str(raw.get("sha256", "")).lower(),
                 binary=str(raw.get("binary", name)),
                 platforms=tuple(raw.get("platforms", ()) or ()),
+                source=str(raw.get("source", "")),
             )
         return specs
+
+    def is_simulated(self, name: str) -> bool:
+        """True when the manifest entry for *name* is a simulation stub."""
+        spec = self._manifest.get(name)
+        return bool(spec and spec.source == "portable_wrapper")
+
+    def is_effectively_simulated(self, name: str) -> bool:
+        """True only when the binary that would actually execute is a stub.
+
+        A real host installation of the same tool wins over the manifest
+        classification: if ``resolve()`` lands on a host binary, the tool is
+        real even though a wrapper entry exists in the manifest.
+        """
+        if not self.is_simulated(name):
+            return False
+        bundled = self.bundled_path(name)
+        if not bundled:
+            return False
+        return self.resolve(name) == bundled
 
     @staticmethod
     def _platform_key() -> str:
@@ -98,6 +138,12 @@ class ToolRuntime:
 
     def bundled_path(self, name: str) -> Optional[str]:
         spec = self._manifest.get(name, ToolSpec(name=name, binary=name))
+        # SECURITY FIX (SEC-013): simulation stubs are never resolved unless
+        # explicitly enabled.  Their hash verifies *the stub itself*, which
+        # previously made fabricated output appear as a "verified" real tool
+        # and — via engine findings conversion — produced fabricated findings.
+        if spec.source == "portable_wrapper" and not simulated_tools_allowed():
+            return None
         path = (self.bin_dir / spec.binary).resolve()
         try:
             path.relative_to(self.bin_dir.resolve())
@@ -139,12 +185,19 @@ class ToolRuntime:
         for name in sorted(names):
             bundled = self.bundled_path(name)
             host = shutil.which(name)
+            simulated = self.is_simulated(name)
             out[name] = {
                 "available": bool(bundled or (host and self.allow_host_tools)),
                 "source": "bundled" if bundled else ("host" if host and self.allow_host_tools else "none"),
                 "integrity": "verified" if bundled else ("unverified-host" if host and self.allow_host_tools else "missing"),
                 "bundled_path": bundled,
                 "host_path": host,
+                # SEC-013: transparent provenance — dashboards/APIs must be
+                # able to tell real tools from bundled simulation stubs.
+                "simulated": simulated,
+                "simulation_disabled_by_default": bool(
+                    simulated and not simulated_tools_allowed() and not (host and self.allow_host_tools)
+                ),
             }
         return out
 
@@ -251,3 +304,8 @@ RUNTIME = ToolRuntime()
 
 def resolve_tool(name: str) -> Optional[str]:
     return RUNTIME.resolve(name)
+
+
+def is_simulated_tool(name: str) -> bool:
+    """Module-level helper: would executing *name* run a simulation stub?"""
+    return RUNTIME.is_effectively_simulated(name)

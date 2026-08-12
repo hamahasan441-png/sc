@@ -312,17 +312,23 @@ def _has_pip() -> bool:
 
 
 def _is_tool_installed(tool_name: str) -> bool:
-    """Check if a tool binary is available in PATH or runtime/bin."""
+    """Check if a tool binary is available in PATH or runtime/bin.
+
+    SECURITY (SEC-013): the runtime/bin check goes through ``ToolRuntime``
+    so bundled *simulation* stubs only count as installed when simulation
+    mode is explicitly enabled — otherwise they are inert placeholders, not
+    real tools.
+    """
     info = TOOL_REGISTRY.get(tool_name)
     binary = info.binary_name if info else tool_name
     # Check PATH
     if shutil.which(binary):
         return True
-    # Check portable runtime bin (runtime/bin/<tool>)
+    # Check portable runtime bin via the integrity/simulation-aware runtime
     try:
-        from pathlib import Path
-        runtime_bin = Path(__file__).resolve().parents[1] / "runtime" / "bin" / binary
-        if runtime_bin.is_file() and os.access(runtime_bin, os.X_OK):
+        from core.tool_runtime import RUNTIME
+
+        if RUNTIME.bundled_path(binary):
             return True
     except Exception:
         pass

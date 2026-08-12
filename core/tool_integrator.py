@@ -41,6 +41,10 @@ class ToolResult:
     duration_seconds: float = 0.0
     timestamp: str = ""
     error: str = ""
+    # SEC-013: True when the output came from a bundled simulation stub
+    # (portable wrapper) instead of the real tool.  Consumers must not
+    # present simulated output as real scan evidence.
+    simulated: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -54,6 +58,7 @@ class ToolResult:
             "duration_seconds": self.duration_seconds,
             "timestamp": self.timestamp,
             "error": self.error,
+            "simulated": self.simulated,
         }
 
 
@@ -838,7 +843,16 @@ class ToolIntegrator:
                 success=False,
                 error=f"Unknown tool: {tool_name}",
             )
-        return adapter.run(target, **kwargs)
+        result = adapter.run(target, **kwargs)
+        # SEC-013: centrally tag simulation-stub output so API consumers
+        # can never mistake it for real tool results.
+        try:
+            from core.tool_runtime import is_simulated_tool
+
+            result.simulated = bool(is_simulated_tool(tool_name))
+        except Exception:
+            result.simulated = False
+        return result
 
     def run_recon_suite(self, target: str, domain: str = "") -> Dict[str, ToolResult]:
         """Run a full reconnaissance suite with all available tools."""

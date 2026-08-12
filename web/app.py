@@ -190,6 +190,22 @@ def _require_api_key(f):
     return decorated
 
 
+def _scan_authorization_acknowledged() -> bool:
+    """Return True iff the operator acknowledged post-exploit capability.
+
+    SECURITY (SEC-002): dashboard-initiated scans must carry the same
+    authorization signal the CLI provides via ``--authorized``.  The web
+    layer derives it from the framework gate (``ATOMIC_AUTHORIZED=1``),
+    fail-closed when the module is unavailable.
+    """
+    try:
+        from core.authorization import is_authorized as _is_auth
+
+        return bool(_is_auth())
+    except Exception:
+        return False
+
+
 def _tool_target_in_configured_scope(target: str) -> bool:
     """Check if direct tool execution target is in configured scope.
 
@@ -573,18 +589,41 @@ def _is_shell_command_allowed(cmd: str) -> bool:
     return True
 
 
+# SECURITY (SEC-009): nonce-free hardening split.  The new SPA (served at
+# "/") is fully file-based, so it gets a CSP WITHOUT 'unsafe-inline' for
+# scripts.  The legacy dashboard relies on inline scripts and keeps the
+# permissive policy, isolated to its own route.
+_CSP_STRICT = (
+    "default-src 'self'; "
+    "script-src 'self' https://cdnjs.cloudflare.com; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self' ws: wss:; "
+    "font-src 'self'; "
+    "object-src 'none'; base-uri 'self'; frame-ancestors 'none';"
+)
+_CSP_LEGACY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self' ws: wss:; "
+    "font-src 'self'; "
+    "object-src 'none'; base-uri 'self'; frame-ancestors 'none';"
+)
+
+
 @app.after_request
 def _set_security_headers(response):
     """Attach security headers to every HTTP response."""
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-        "connect-src 'self' ws: wss:; font-src 'self';",
-    )
+    path = request.path or ""
+    if path == "/legacy" or path.startswith("/legacy/"):
+        response.headers.setdefault("Content-Security-Policy", _CSP_LEGACY)
+    else:
+        response.headers.setdefault("Content-Security-Policy", _CSP_STRICT)
     # Only set HSTS when served over HTTPS to avoid issues over plain HTTP
     if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
         response.headers.setdefault(
@@ -1034,6 +1073,23 @@ def start_scan():
     if not raw_targets:
         return jsonify({"status": "error", "data": "Missing target or targets"}), 400
 
+    # SECURITY FIX (SEC-012): a scan thread is spawned per target, so an
+    # unbounded list is a thread/memory DoS vector for any scan.create user.
+    try:
+        _max_batch = max(1, int(os.environ.get("ATOMIC_MAX_BATCH_TARGETS", "50")))
+    except ValueError:
+        _max_batch = 50
+    if len(raw_targets) > _max_batch:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "data": f"Too many targets ({len(raw_targets)}); maximum is {_max_batch} per scan",
+                }
+            ),
+            400,
+        )
+
     # Normalize each target so a user can type "example.com" (or
     # "example.com:8080/admin" or "192.168.1.1") without thinking
     # about the scheme. See atomic.urlnorm for the rules.
@@ -1140,6 +1196,11 @@ def start_scan():
             "rotate_ua": True,
             "output_dir": Config.REPORTS_DIR,
             "auto_external_tools": True,
+            # SECURITY FIX (SEC-002): carry the framework authorization gate
+            # explicitly (fail-closed).  Dashboard scans only enable
+            # exploitation when the server itself was started with
+            # ATOMIC_AUTHORIZED=1; otherwise auto_exploit stays detection-only.
+            "authorized": _scan_authorization_acknowledged(),
             # Local LLM (Ollama) — auto-start daemon and pull model in
             # the scan thread when the user opted in.
             "use_local_llm": use_local_llm,
@@ -1450,6 +1511,30 @@ def run_post_exploit(scan_id):
     if engine is None or not engine.findings:
         return jsonify({"status": "error", "data": "No confirmed findings to exploit"}), 400
 
+    # SECURITY FIX (SEC-002): post-exploitation is destructive.  RBAC alone
+    # (``exploit.run``) is not the framework's post-exploit authorization
+    # model — the operator must also have acknowledged exploitation via
+    # ``--authorized`` / ``ATOMIC_AUTHORIZED=1`` (see core/authorization.py).
+    try:
+        from core.authorization import is_authorized as _post_exploit_authorized
+
+        if not _post_exploit_authorized():
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "data": (
+                            "Post-exploitation requires explicit authorization: "
+                            "start the server with ATOMIC_AUTHORIZED=1 "
+                            "(or run exploitation from the CLI with --authorized)"
+                        ),
+                    }
+                ),
+                403,
+            )
+    except ImportError:
+        return jsonify({"status": "error", "data": "Authorization module unavailable"}), 500
+
     try:
         from core.post_exploit import PostExploitEngine
 
@@ -1626,6 +1711,27 @@ def api_repeater():
             url = _normalize(url)
         except (ValueError, TypeError, ImportError):
             return jsonify({"status": "error", "data": "URL must start with http:// or https://"}), 400
+    # SECURITY (SEC-004): the repeater is an authenticated request-sender;
+    # it must honor the same centralized network policy as the scanner
+    # (configured scope + optional private/metadata blocking).
+    try:
+        from core.netpolicy import NetworkSecurityPolicy
+
+        _np = NetworkSecurityPolicy.from_env()
+        if _np.active:
+            allowed, reason = _np.allow_url(url)
+            if not allowed:
+                return (
+                    jsonify(
+                        {
+                            "status": "error",
+                            "data": f"URL blocked by network policy: {reason}",
+                        }
+                    ),
+                    403,
+                )
+    except ImportError:
+        pass
     try:
         from core.repeater import Repeater
 
@@ -2754,6 +2860,53 @@ def list_external_tools():
         return jsonify({"status": "error", "data": "Tool execution failed"}), 500
 
 
+# SECURITY (SEC-003): API callers may only pass adapter kwargs that are on
+# this allowlist.  Free-form ``**params`` plumbing previously let callers
+# reach file-path and subcommand arguments of the underlying tools.
+_TOOL_PARAM_ALLOWLIST = {
+    # core.tool_integrator adapters
+    "nmap": {"ports", "scan_type", "timeout"},
+    "nuclei": {"templates", "severity", "use_builtin", "timeout"},
+    "nikto": {"tuning", "timeout"},
+    "whatweb": {"aggression", "timeout"},
+    "subfinder": {"timeout"},
+    "httpx": {"paths", "follow_redirects", "input_list", "tech_detect", "timeout"},
+    "ffuf": {"wordlist", "extensions", "filter_codes", "timeout"},
+    # core.recon_arsenal adapters
+    "amass": {"mode", "timeout"},
+    "dnsx": {"wordlist", "record_types", "timeout"},
+    "katana": {"depth", "js_crawl", "timeout"},
+    "gau": {"timeout"},
+    "waybackurls": {"timeout"},
+    "paramspider": {"exclude", "timeout"},
+    "gobuster": {"mode", "wordlist", "extensions", "timeout"},
+    "feroxbuster": {"wordlist", "depth", "extensions", "filter_code", "timeout"},
+    "dirsearch": {"timeout"},
+    "masscan": {"ports", "rate", "timeout"},
+    "rustscan": {"ports", "batch_size", "timeout"},
+    "hakrawler": {"depth", "scope", "timeout"},
+    "arjun": {"method", "timeout"},
+}
+
+
+def _filter_tool_params(tool_name: str, body: dict):
+    """Return (params, error_response).  Rejects unknown kwargs (fail-closed)."""
+    allowed = _TOOL_PARAM_ALLOWLIST.get(tool_name, set())
+    candidates = {k: v for k, v in body.items() if k not in ("target", "domain")}
+    unknown = sorted(k for k in candidates if k not in allowed)
+    if unknown:
+        return None, (
+            jsonify(
+                {
+                    "status": "error",
+                    "data": f"Unsupported parameter(s) for {tool_name}: {', '.join(unknown)}",
+                }
+            ),
+            400,
+        )
+    return {k: candidates[k] for k in candidates if k in allowed}, None
+
+
 @app.route("/api/tools/external/<tool_name>/run", methods=["POST"])
 @_require_permission("tools.use")
 @_rate_limit
@@ -2765,6 +2918,10 @@ def run_external_tool(tool_name):
     target = body["target"]
     if not _tool_target_in_configured_scope(target):
         return jsonify({"status": "error", "data": "Target is outside the configured authorization scope"}), 403
+    # SEC-003: reject unknown kwargs instead of forwarding them blindly.
+    params, err = _filter_tool_params(tool_name, body)
+    if err:
+        return err
     try:
         from core.tool_integrator import ToolIntegrator
 
@@ -2774,7 +2931,6 @@ def run_external_tool(tool_name):
             return jsonify({"status": "error", "data": f"Unknown tool: {tool_name}"}), 404
         if not available[tool_name]:
             return jsonify({"status": "error", "data": f"Tool {tool_name} is not installed"}), 503
-        params = {k: v for k, v in body.items() if k != "target"}
         result = integrator.run_tool(tool_name, body["target"], **params)
         return jsonify({"status": "success", "data": result.to_dict()})
     except Exception:
@@ -2820,6 +2976,10 @@ def run_recon_tool(tool_name):
     target = body["target"]
     if not _tool_target_in_configured_scope(target):
         return jsonify({"status": "error", "data": "Target is outside the configured authorization scope"}), 403
+    # SEC-003: reject unknown kwargs instead of forwarding them blindly.
+    params, err = _filter_tool_params(tool_name, body)
+    if err:
+        return err
     try:
         from core.recon_arsenal import ReconArsenal
 
@@ -2829,7 +2989,6 @@ def run_recon_tool(tool_name):
             return jsonify({"status": "error", "data": f"Unknown recon tool: {tool_name}"}), 404
         if not available[tool_name]:
             return jsonify({"status": "error", "data": f"Tool {tool_name} is not installed"}), 503
-        params = {k: v for k, v in body.items() if k != "target"}
         result = arsenal.run_tool(tool_name, body["target"], **params)
         return jsonify({"status": "success", "data": result.to_dict()})
     except Exception:
@@ -2844,12 +3003,20 @@ def run_full_recon():
     body = request.get_json(silent=True)
     if not body or not body.get("target"):
         return jsonify({"status": "error", "data": "Missing target"}), 400
+    # SECURITY FIX (SEC-001): this endpoint previously skipped the centralized
+    # scope gate its sibling tool endpoints enforce, allowing the full
+    # arsenal (incl. port scanners) against arbitrary targets.
+    target = body["target"]
+    if not _tool_target_in_configured_scope(target):
+        return jsonify({"status": "error", "data": "Target is outside the configured authorization scope"}), 403
+    domain = body.get("domain", "") or ""
+    if domain and not _tool_target_in_configured_scope(domain):
+        return jsonify({"status": "error", "data": "Domain is outside the configured authorization scope"}), 403
     try:
         from core.recon_arsenal import ReconArsenal
 
         arsenal = ReconArsenal()
-        domain = body.get("domain", "")
-        results = arsenal.run_full_recon(body["target"], domain=domain)
+        results = arsenal.run_full_recon(target, domain=domain)
         return jsonify(
             {
                 "status": "success",
@@ -4821,6 +4988,9 @@ def create_app(host="0.0.0.0", port=5000, debug=False):
             cfg.setdefault("output_dir", Config.REPORTS_DIR)
             cfg.setdefault("quiet", True)
             cfg.setdefault("auto_external_tools", True)
+            # SECURITY (SEC-002): scheduled scans inherit the server-level
+            # authorization gate; never default-open exploitation.
+            cfg.setdefault("authorized", _scan_authorization_acknowledged())
             threading.Thread(
                 target=_run_scan,
                 args=(scan_id, entry.target, cfg),
@@ -4835,7 +5005,17 @@ def create_app(host="0.0.0.0", port=5000, debug=False):
         if _API_KEY:
             logger.info("API key authentication enabled")
         else:
-            logger.warning("No ATOMIC_API_KEY set — API endpoints are open")
+            logger.warning(
+                "No ATOMIC_API_KEY set — static service key disabled "
+                "(JWT/user-API-key authentication still enforced)"
+            )
+        # SECURITY (SEC-006): make the fail-open tool-scope default loud.
+        if not os.environ.get("ATOMIC_ALLOWED_DOMAINS", "").strip():
+            logger.warning(
+                "ATOMIC_ALLOWED_DOMAINS not configured — direct tool/recon "
+                "endpoints accept ANY target unless ATOMIC_TOOL_SCOPE_STRICT=1. "
+                "Set both for shared/production deployments."
+            )
         logger.warning("FOR AUTHORIZED TESTING ONLY")
         # Use SocketIO runner if available (enables WebSocket), else plain Flask
         if socketio is not None:

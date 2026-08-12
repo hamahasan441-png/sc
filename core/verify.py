@@ -377,14 +377,17 @@ def _classify_reflection_context(payload: str, body: str) -> str:
     pre = body[max(0, idx - 60): idx].lower()
     post = body[idx + len(payload): idx + len(payload) + 60].lower()
 
-    # Use both ``pre`` and ``post`` so we don't miscategorise contexts whose
-    # delimiter sits AFTER the payload (e.g. ``"key":"PAYLOAD"`` — the
-    # closing quote is only visible in ``post``).
+    # JSON context: the payload sits in a quoted *value* position of a JSON
+    # document, i.e. the text immediately before it ends with ``:"`` /
+    # ``: "`` (colon + opening quote).  The previous heuristic also treated
+    # any reflection whose ``pre``/``post`` touched a quote as JSON, which
+    # swallowed ordinary HTML attribute values — ``<input value="MARKER">``
+    # ends in a quote too (TST-006 regression).
+    pre_r = pre.rstrip()
     if (
         "application/json" in body[:200].lower()
-        or pre.lstrip().startswith('"')
-        or ":{" in pre
-        or post.rstrip().startswith('"')
+        or pre_r.endswith(':"')
+        or pre_r.endswith(': "')
     ):
         return "json"
     # Check JS context before attr (script tags contain var x = '...' which looks like attr)

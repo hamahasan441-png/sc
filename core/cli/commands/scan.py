@@ -76,12 +76,34 @@ def _build_config_from_args(args):
         "exploit_search", "agent_scan", "attack_map"
     ]
 
+    # BUG FIX (TST-006/CLI): these flags were parsed but never propagated to
+    # the engine config, silently disabling Scapy/network/recon-suite modes.
+    # The engine reads exactly these keys from ``modules`` (see
+    # AtomicEngine.scan), so they must be carried like every other module.
+    extended_module_keys = [
+        "subdomains", "tech_detect", "dir_brute",
+        "net_exploit", "tech_exploit", "sqlmap",
+        "scapy", "scapy_crawl", "stealth_scan", "arp_discovery",
+        "dns_recon", "traceroute", "scapy_vuln_scan", "scapy_attack_chain",
+    ]
+
+    point_to_point = bool(getattr(args, "point_to_point", False))
+
     # Quick profile handling
-    if getattr(args, "full", False) or getattr(args, "point_to_point", False):
+    if getattr(args, "full", False) or point_to_point:
         modules = {k: True for k in module_keys}
+        if point_to_point:
+            # --point-to-point is the "everything" profile: it also enables
+            # the extended network/scapy suite (individually opt-in flags).
+            modules.update({k: True for k in extended_module_keys})
+        else:
+            # --full keeps historical semantics: extended modes only when
+            # their individual flags are also supplied.
+            for k in extended_module_keys:
+                modules[k] = bool(getattr(args, k, False))
     else:
         modules = {}
-        for k in module_keys:
+        for k in module_keys + extended_module_keys:
             attr = k.replace("-", "_")
             if hasattr(args, attr):
                 modules[k] = bool(getattr(args, attr))
@@ -94,15 +116,25 @@ def _build_config_from_args(args):
             elif getattr(args, "standard", False):
                 modules.update({"sqli": True, "xss": True, "lfi": True, "cors": True, "ssrf": True, "jwt": True})
             elif getattr(args, "deep", False):
-                modules = {k: True for k in module_keys}
+                modules = {k: True for k in module_keys + extended_module_keys}
 
     modules["ports"] = getattr(args, "ports", None)
-    modules["brute"] = getattr(args, "brute", False)
-    modules["shell"] = getattr(args, "shell", False)
-    modules["dump"] = getattr(args, "dump", False)
-    modules["os_shell"] = getattr(args, "os_shell", False)
-    modules["exploit_chain"] = getattr(args, "exploit_chain", False)
-    modules["auto_exploit"] = getattr(args, "auto_exploit", False) or getattr(args, "full", False)
+    if point_to_point and not modules["ports"]:
+        # "Everything" profile implies the full port range for port scanning.
+        modules["ports"] = "1-65535"
+    modules["subnet"] = getattr(args, "subnet", "") or ""
+    modules["brute"] = getattr(args, "brute", False) or point_to_point
+    modules["shell"] = getattr(args, "shell", False) or point_to_point
+    modules["dump"] = getattr(args, "dump", False) or point_to_point
+    modules["os_shell"] = getattr(args, "os_shell", False) or point_to_point
+    modules["exploit_chain"] = getattr(args, "exploit_chain", False) or point_to_point
+    modules["auto_exploit"] = (
+        getattr(args, "auto_exploit", False) or getattr(args, "full", False) or point_to_point
+    )
+    # attack_map builds its kill-chain visualization from exploit-intel
+    # results, so it implicitly requires exploit_search.
+    if modules.get("attack_map"):
+        modules["exploit_search"] = True
 
     # Scope handling: strict if --strict-scope or --allow-domain given
     allowed_domains = _parse_csv(getattr(args, "allow_domain", "") or "")
@@ -164,14 +196,23 @@ def handle_scan(args):
 
     config = _build_config_from_args(args)
 
-    # Governance guard: scanning requires --authorized (for all scans, not just regulated)
-    if targets and not config.get("authorized"):
-        # Allow if --ci-mode? No, original required authorized for all
-        # But for tests that mock engine, we still want to enforce sys.exit
+    # Governance guard: scanning requires explicit operator authorization
+    # (for all scans, not just regulated).  The canonical gate is
+    # ``core.authorization.is_authorized()``: the ``--authorized`` CLI flag
+    # OR ``ATOMIC_AUTHORIZED=1`` in the environment — both are deliberate
+    # acknowledgments.  Fail-closed when neither is present.
+    _authz_flag = bool(config.get("authorized"))
+    try:
+        from core.authorization import is_authorized as _env_authorized
+
+        _authz_env = bool(_env_authorized())
+    except Exception:
+        _authz_env = False
+    if targets and not (_authz_flag or _authz_env):
         print(
             f"{Colors.error('Authorization confirmation required.')}\n"
             f"{Colors.warning('This framework is for AUTHORIZED security testing only.')}\n"
-            f"{Colors.info('Re-run with --authorized to confirm you have written permission to test the listed targets.')}"
+            f"{Colors.info('Re-run with --authorized (or set ATOMIC_AUTHORIZED=1) to confirm you have written permission to test the listed targets.')}"
         )
         sys.exit(1)
 
