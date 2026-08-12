@@ -23,6 +23,7 @@ Plugin registration:
   - API: call ``plugin_manager.register(plugin_instance)``
 """
 
+import hashlib
 import importlib
 import importlib.util
 import os
@@ -181,6 +182,9 @@ class PluginManager:
         if not os.path.isfile(init_path):
             return None
 
+        if not self._plugin_integrity_ok(plugin_path, init_path):
+            return None
+
         try:
             # Add plugin dir to path temporarily — remove after load
             added = False
@@ -254,6 +258,33 @@ class PluginManager:
                     sys.path.remove(plugin_path)
             except ValueError:
                 pass
+
+    @staticmethod
+    def _allow_unsigned_plugins() -> bool:
+        flag = os.environ.get("ATOMIC_ALLOW_UNSIGNED_PLUGINS", "").strip().lower()
+        return flag in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _plugin_integrity_ok(plugin_path: str, init_path: str) -> bool:
+        """Refuse drop-in plugins without a matching PLUGIN.sha256 unless opted in."""
+        if PluginManager._allow_unsigned_plugins():
+            return True
+        try:
+            digest = hashlib.sha256()
+            with open(init_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    digest.update(chunk)
+            expected = digest.hexdigest().lower()
+        except OSError:
+            return False
+        manifest = os.path.join(plugin_path, "PLUGIN.sha256")
+        if not os.path.isfile(manifest):
+            return False
+        try:
+            raw = open(manifest, "r", encoding="utf-8").read().strip().split()[0].lower()
+        except OSError:
+            return False
+        return bool(raw) and raw == expected
 
     def load_all(self) -> int:
         """Discover and load all plugins. Returns count of loaded plugins."""

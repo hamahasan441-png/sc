@@ -220,8 +220,16 @@ def _tool_target_in_configured_scope(target: str) -> bool:
     raw = os.environ.get("ATOMIC_ALLOWED_DOMAINS", "").strip()
     strict = os.environ.get("ATOMIC_TOOL_SCOPE_STRICT", "").lower() in {"1", "true", "yes", "on"}
     if not raw:
-        # No scope configured: allow by default unless strict mode enabled
+        # Fail-closed when authentication is required (production default).
+        # Local/dev (ATOMIC_AUTH_REQUIRED=false) or Flask TESTING stay usable.
         if strict:
+            return False
+        try:
+            if app.config.get("TESTING"):
+                return True
+        except Exception:
+            pass
+        if _AUTH_REQUIRED:
             return False
         return True
     try:
@@ -3179,7 +3187,13 @@ def post_chat_message():
     if not body or not isinstance(body.get("message"), str) or not body["message"].strip():
         return jsonify({"status": "error", "data": "Missing or empty message"}), 400
 
-    msg = _create_chat_message(body.get("sender", "Anonymous"), body["message"])
+    caller = _get_current_user()
+    if caller and caller.get("sub"):
+        sender = caller["sub"]
+    else:
+        # Only when auth is off / TESTING — never trust client sender in prod.
+        sender = body.get("sender", "Anonymous")
+    msg = _create_chat_message(sender, body["message"])
     _emit_ws("chat_message", msg)
 
     return jsonify({"status": "success", "data": msg}), 201
@@ -3338,7 +3352,31 @@ def _ollama_available():
 
 
 def _ollama_host():
-    return os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    """Return the Ollama base URL, restricted to loopback unless opted in.
+
+    ``OLLAMA_HOST`` is operator-controlled, but a compromised env or a
+    confused-deputy path must not turn dashboard LLM helpers into an SSRF
+    client against cloud metadata or internal HTTP services.
+    """
+    raw = os.environ.get("OLLAMA_HOST", "http://localhost:11434").strip() or "http://localhost:11434"
+    allow_remote = os.environ.get("ATOMIC_OLLAMA_ALLOW_REMOTE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if allow_remote:
+        return raw.rstrip("/")
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme not in ("http", "https") or host not in {"localhost", "127.0.0.1", "::1"}:
+            return "http://localhost:11434"
+    except Exception:
+        return "http://localhost:11434"
+    return raw.rstrip("/")
 
 
 def _ollama_request_ex(path, method="GET", json_data=None, timeout=120):

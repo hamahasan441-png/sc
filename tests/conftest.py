@@ -23,6 +23,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 @pytest.fixture(autouse=True)
+def _allow_unsigned_plugins_in_tests(monkeypatch):
+    """Disk-load plugins in the suite without writing PLUGIN.sha256 everywhere.
+
+    Production remains fail-closed. Gate tests must:
+        monkeypatch.delenv(\"ATOMIC_ALLOW_UNSIGNED_PLUGINS\", raising=False)
+    """
+    monkeypatch.setenv("ATOMIC_ALLOW_UNSIGNED_PLUGINS", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _operator_authorized(monkeypatch):
     """Run every test as an acknowledged operator unless it opts out.
 

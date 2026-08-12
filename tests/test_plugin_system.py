@@ -58,11 +58,17 @@ class TestPluginManager(unittest.TestCase):
     """Test PluginManager core functionality."""
 
     def setUp(self):
+        self._prev_unsigned = os.environ.get("ATOMIC_ALLOW_UNSIGNED_PLUGINS")
+        os.environ["ATOMIC_ALLOW_UNSIGNED_PLUGINS"] = "1"
         self.tmpdir = tempfile.mkdtemp()
         self.manager = PluginManager(plugin_dir=self.tmpdir)
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
+        if self._prev_unsigned is None:
+            os.environ.pop("ATOMIC_ALLOW_UNSIGNED_PLUGINS", None)
+        else:
+            os.environ["ATOMIC_ALLOW_UNSIGNED_PLUGINS"] = self._prev_unsigned
 
     def test_discover_empty_dir(self):
         discovered = self.manager.discover_plugins()
