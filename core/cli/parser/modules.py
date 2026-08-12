@@ -49,3 +49,10 @@ def add_module_arguments(parser: argparse.ArgumentParser):
     g.add_argument("--browser-engine", choices=["auto", "playwright", "selenium"], default="auto", help="Headless browser engine to use (default: auto)")
     g.add_argument("--llm-logic", action="store_true", help="Enable LLM-driven business-logic flaw scanner (workflow bypass, IDOR variants, etc.)")
     g.add_argument("--gatebreaker", action="store_true", help="GateBreaker mode: detect and bypass WAF, auth, and rate-limit gates")
+    g.add_argument(
+        "--firewall-bypass",
+        "--fw-bypass",
+        action="store_true",
+        dest="firewall_bypass",
+        help="Network/NGFW/ACL firewall bypass: path ACL, IP allowlist, port/protocol hop, origin-IP, IPv6",
+    )

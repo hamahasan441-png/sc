@@ -40,6 +40,7 @@ ALL_MODULE_KEYS = [
     "osint", "fuzzer", "cloud_scan", "oauth", "mfa_bypass",
     "api_versioning", "dep_confusion", "llm_logic", "h2_smuggling",
     "cache_poisoning", "api_abuse", "deep_scan", "gatebreaker",
+    "firewall_bypass",
 ]
 
 # Always-on discovery / recon (no exploit risk).
@@ -89,6 +90,7 @@ PROFILES: Dict[str, Profile] = {
             websocket=True, deserialization=True, osint=True, fuzzer=True,
             cloud_scan=True, h2_smuggling=True, cache_poisoning=True,
             api_abuse=True, deep_scan=True, gatebreaker=True,
+            firewall_bypass=True,
         ),
         threads=50, depth=4, timeout=20, delay=0.2, evasion="medium",
         waf_bypass=True, auto_external_tools=True,
@@ -111,7 +113,7 @@ PROFILES: Dict[str, Profile] = {
             cloud_scan=True, oauth=True, mfa_bypass=True,
             api_versioning=True, dep_confusion=True, llm_logic=True,
             h2_smuggling=True, cache_poisoning=True, api_abuse=True,
-            deep_scan=True, gatebreaker=True,
+            deep_scan=True, gatebreaker=True, firewall_bypass=True,
         ),
         threads=100, depth=5, timeout=30, delay=0.25, evasion="high",
         waf_bypass=True, auto_external_tools=True,
@@ -160,6 +162,7 @@ def to_main_args(profile: Profile, target: str, authorized: bool) -> List[str]:
         "h2_smuggling": "--h2-smuggling",
         "cache_poisoning": "--cache-poisoning", "api_abuse": "--api-abuse",
         "deep_scan": "--deep-scan", "gatebreaker": "--gatebreaker",
+        "firewall_bypass": "--firewall-bypass",
     }
     for key, flag in mod_map.items():
         if profile.modules.get(key):

@@ -49,10 +49,13 @@ REMEDIATION_MAP = {
     "open redirect": "Validate and whitelist redirect URLs. Avoid using user input in redirect targets.",
     "crlf": "Strip or encode CR/LF characters from user input before including in HTTP headers.",
     "http parameter pollution": "Normalize duplicate parameters server-side. Validate input at each processing layer.",
-    "network exploit": "Patch or upgrade affected network services. Restrict access via firewall rules and network segmentation.",
-    "tech exploit": "Update detected technologies and frameworks to latest versions. Remove version disclosure headers.",
-    "missing security header": "Add recommended security headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options).",
-}
+            "network exploit": "Patch or upgrade affected network services. Restrict access via firewall rules and network segmentation.",
+            "tech exploit": "Update detected technologies and frameworks to latest versions. Remove version disclosure headers.",
+            "missing security header": "Add recommended security headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options).",
+            "firewall bypass": "Enforce ACLs on the origin, not only the edge. Do not trust X-Forwarded-For / CF-Connecting-IP unless the hop is a known proxy. Normalize paths before matching URL rules. Restrict origin to CDN/WAF source IPs only.",
+            "path acl": "Normalize and decode URLs before ACL evaluation. Match on the canonical path, not the raw request-target.",
+            "ip allowlist": "Ignore client-supplied forwarding headers except from a pinned proxy CIDR. Bind allowlists to the TCP source address.",
+        }
 
 
 @dataclass
@@ -355,7 +358,7 @@ class AtomicEngine:
         # also pipes outbound scan traffic through ``bypass.apply()``
         # to inject IP-spoofing / origin-spoofing headers when
         # WAF-class blocks are detected.
-        if config.get("full_bypass") or config.get("waf_bypass"):
+        if config.get("full_bypass") or config.get("waf_bypass") or config.get("firewall_bypass"):
             try:
                 from core.bypass import build_orchestrator
 
@@ -440,6 +443,9 @@ class AtomicEngine:
             # GateBreaker: unified WAF/auth/rate-limit gate detection and
             # bypass orchestration on top of the BypassOrchestrator ladder.
             "gatebreaker": ("modules.gatebreaker", "GateBreakerModule"),
+            # Firewall Bypass: network / NGFW / ACL (path, IP, port,
+            # protocol, origin hop) — complementary to WAF/GateBreaker.
+            "firewall_bypass": ("modules.firewall_bypass", "FirewallBypassModule"),
         }
 
         modules_config = self.config.get("modules", {})
