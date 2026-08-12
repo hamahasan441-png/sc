@@ -72,6 +72,7 @@ def _build_config_from_args(args):
         "cloud_scan", "osint", "fuzzer", "recon", "discovery", "oauth",
         "mfa_bypass", "api_versioning", "dep_confusion", "llm_logic",
         "h2_smuggling", "cache_poisoning", "api_abuse", "deep_scan", "gatebreaker",
+        "firewall_bypass",
         "shield_detect", "real_ip", "passive_recon", "enrich", "chain_detect",
         "exploit_search", "agent_scan", "attack_map"
     ]
@@ -135,6 +136,10 @@ def _build_config_from_args(args):
     # results, so it implicitly requires exploit_search.
     if modules.get("attack_map"):
         modules["exploit_search"] = True
+    # --firewall-bypass / --full-bypass must actually load the module,
+    # not just flip the orchestrator flag.
+    if getattr(args, "firewall_bypass", False) or getattr(args, "full_bypass", False):
+        modules["firewall_bypass"] = True
 
     # Scope handling: strict if --strict-scope or --allow-domain given
     allowed_domains = _parse_csv(getattr(args, "allow_domain", "") or "")
@@ -148,8 +153,9 @@ def _build_config_from_args(args):
         "timeout": getattr(args, "timeout", 15),
         "delay": getattr(args, "delay", 0.1),
         "evasion": getattr(args, "evasion", "none"),
-        "waf_bypass": getattr(args, "waf_bypass", False) or getattr(args, "full_bypass", False) or getattr(args, "gatebreaker", False),
-        "full_bypass": getattr(args, "full_bypass", False),
+        "waf_bypass": getattr(args, "waf_bypass", False) or getattr(args, "full_bypass", False) or getattr(args, "gatebreaker", False) or getattr(args, "firewall_bypass", False),
+        "full_bypass": getattr(args, "full_bypass", False) or getattr(args, "firewall_bypass", False),
+        "firewall_bypass": getattr(args, "firewall_bypass", False) or getattr(args, "full_bypass", False),
         "tor": getattr(args, "tor", False),
         "proxy": getattr(args, "proxy", None),
         "rotate_proxy": getattr(args, "rotate_proxy", False),

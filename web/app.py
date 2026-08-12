@@ -1135,6 +1135,8 @@ def start_scan():
         "cors",
         "jwt",
         "upload",
+        "gatebreaker",
+        "firewall_bypass",
     ]
     modules_dict = {}
     for key in all_module_keys:
