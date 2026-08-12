@@ -33,7 +33,7 @@ class TestDashboardRoute(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
 
     def test_dashboard_contains_atomic(self):
-        resp = self.client.get("/")
+        resp = self.client.get("/legacy")
         self.assertIn(b"ATOMIC", resp.data)
 
 
@@ -483,16 +483,16 @@ class TestDashboardContent(unittest.TestCase):
         self.assertIn("text/html", resp.content_type)
 
     def test_dashboard_contains_html_tags(self):
-        resp = self.client.get("/")
+        resp = self.client.get("/legacy")
         self.assertIn(b"<html", resp.data.lower())
         self.assertIn(b"</html>", resp.data.lower())
 
     def test_dashboard_contains_head_section(self):
-        resp = self.client.get("/")
+        resp = self.client.get("/legacy")
         self.assertIn(b"<head", resp.data.lower())
 
     def test_dashboard_contains_body_section(self):
-        resp = self.client.get("/")
+        resp = self.client.get("/legacy")
         self.assertIn(b"<body", resp.data.lower())
 
 
@@ -891,7 +891,7 @@ class TestChatAPI(unittest.TestCase):
 
     def test_dashboard_contains_chat_tab(self):
         """Dashboard HTML includes Chat tab."""
-        resp = self.client.get("/")
+        resp = self.client.get("/legacy")
         self.assertIn(b"Chat", resp.data)
         self.assertIn(b"panel-chat", resp.data)
 
@@ -942,7 +942,7 @@ class TestAIBrainAPI(unittest.TestCase):
 
     def test_dashboard_contains_ai_brain_tab(self):
         """Dashboard HTML includes AI Brain tab."""
-        resp = self.client.get("/")
+        resp = self.client.get("/legacy")
         self.assertIn(b"AI Brain", resp.data)
         self.assertIn(b"panel-ai-brain", resp.data)
 
@@ -1051,3 +1051,21 @@ class TestOllamaAPI(unittest.TestCase):
         resp = self.client.get("/api/ollama/chat/history")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["data"], [])
+
+
+class TestDashboardRoutes(unittest.TestCase):
+    """TST-004 regression: '/' serves the new SPA, '/legacy' the classic UI."""
+
+    def setUp(self):
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+
+    def test_root_serves_spa_shell(self):
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"/static/app/js/main.js", resp.data)
+
+    def test_legacy_serves_classic_dashboard(self):
+        resp = self.client.get("/legacy")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"panel-dashboard", resp.data)

@@ -216,17 +216,24 @@ class ScanScheduler:
             return self._schedules.pop(schedule_id, None) is not None
 
     def get_schedule(self, schedule_id: str) -> Optional[ScheduleEntry]:
-        return self._schedules.get(schedule_id)
+        # RELIABILITY FIX (REL-002): read under the same lock that
+        # add/remove/list use, so concurrent scans of the scheduler thread
+        # cannot observe a half-mutated dict.
+        with self._lock:
+            return self._schedules.get(schedule_id)
 
     def list_schedules(self) -> List[dict]:
         with self._lock:
             return [e.to_dict() for e in self._schedules.values()]
 
     def toggle_schedule(self, schedule_id: str, enabled: bool) -> bool:
-        entry = self._schedules.get(schedule_id)
-        if not entry:
-            return False
-        entry.enabled = enabled
+        # RELIABILITY FIX (REL-002): consistent locking with the rest of
+        # the store (lookup + mutation happen atomically).
+        with self._lock:
+            entry = self._schedules.get(schedule_id)
+            if not entry:
+                return False
+            entry.enabled = enabled
         return True
 
     def get_history(self, limit: int = 50) -> List[dict]:

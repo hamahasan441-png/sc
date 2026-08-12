@@ -30,10 +30,16 @@ class TestRegulatedMissionCLI(unittest.TestCase):
     @patch("main.print_banner")
     @patch("main.AtomicEngine")
     def test_regulated_mission_requires_authorized(self, mock_engine_cls, _mock_banner):
+        import os
+
         argv = ["main.py", "-t", "https://example.com", "--regulated-mission"]
-        with patch.object(sys, "argv", argv), patch("sys.exit", side_effect=_SysExitIntercepted):
-            with self.assertRaises(_SysExitIntercepted):
-                main.main()
+        # Gate test: opt out of the suite-wide operator authorization
+        # (tests/conftest.py) so the fail-closed path is observable.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ATOMIC_AUTHORIZED", None)
+            with patch.object(sys, "argv", argv), patch("sys.exit", side_effect=_SysExitIntercepted):
+                with self.assertRaises(_SysExitIntercepted):
+                    main.main()
         mock_engine_cls.assert_not_called()
 
     @patch("main.print_banner")

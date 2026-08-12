@@ -122,7 +122,7 @@ class SSRFModule(BaseModule):
             try:
                 data = {param: payload}
                 response = self.requester.request(url, method, data=data)
-                if not response:
+                if response is None:
                     continue
                 resp_lower = response.text.lower()
                 for ind in self.ssrf_indicators.get("strong", []):
@@ -165,7 +165,7 @@ class SSRFModule(BaseModule):
             try:
                 data = {param: payload}
                 response = self.requester.request(url, method, data=data)
-                if not response:
+                if response is None:
                     continue
                 text = response.text.lower()
                 # Only check strong indicators and require them to be NEW
@@ -205,7 +205,7 @@ class SSRFModule(BaseModule):
             try:
                 data = {param: payload}
                 response = self.requester.request(url, method, data=data)
-                if not response:
+                if response is None:
                     continue
                 text = response.text.lower()
                 # Only check strong indicators and require them to be NEW
@@ -247,7 +247,7 @@ class SSRFModule(BaseModule):
             try:
                 data = {param: payload}
                 response = self.requester.request(url, method, data=data)
-                if not response:
+                if response is None:
                     continue
                 text = response.text.lower()
                 # Require at least 2 NEW indicators to reduce false positives
@@ -342,7 +342,7 @@ class SSRFModule(BaseModule):
                 data = {param: target}
                 response = self.requester.request(url, method, data=data)
 
-                if not response:
+                if response is None:
                     continue
 
                 # Check for successful internal access
@@ -409,7 +409,7 @@ class SSRFModule(BaseModule):
                     data = {param: endpoint}
                     response = self.requester.request(url, method, data=data, headers=headers)
 
-                    if not response:
+                    if response is None:
                         continue
 
                     # Check for cloud metadata indicators
@@ -476,7 +476,7 @@ class SSRFModule(BaseModule):
                 data = {param: payload}
                 response = self.requester.request(url, method, data=data)
 
-                if not response:
+                if response is None:
                     continue
 
                 # Check for successful access
@@ -539,7 +539,7 @@ class SSRFModule(BaseModule):
                 data = {param: protocol}
                 response = self.requester.request(url, method, data=data)
 
-                if not response:
+                if response is None:
                     continue
 
                 # Check for protocol-specific responses

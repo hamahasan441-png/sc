@@ -40,8 +40,49 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Dict, List
 
-from core.tool_integrator import ToolResult, _run_command
+from core.tool_integrator import ToolResult, _run_command, _is_safe_target_arg
 from core.tool_runtime import resolve_tool
+
+
+# ---------------------------------------------------------------------------
+# SECURITY (SEC-003): adapter input hardening
+# ---------------------------------------------------------------------------
+# Web callers forward user-supplied JSON kwargs to adapter.run(); every
+# adapter-controllable value therefore needs validation:
+#   * wordlist / input_list are filesystem paths — they must resolve inside
+#     an allowed root (source tree, ATOMIC_HOME, or the system temp dir).
+#   * enum-like kwargs (mode, scope, method) are checked against allowlists.
+#   * positional targets are checked for flag injection.
+
+
+def _allowed_wordlist_roots() -> List[str]:
+    roots = []
+    try:
+        from config import Config
+
+        roots.append(Config.BASE_DIR)
+        atomic_home = getattr(Config, "ATOMIC_HOME", "")
+        if atomic_home:
+            roots.append(atomic_home)
+    except Exception:
+        pass
+    roots.append(tempfile.gettempdir())
+    return [os.path.realpath(r) for r in roots if r and os.path.isdir(r)]
+
+
+def _is_allowed_wordlist_path(path: str) -> bool:
+    """True when *path* is an existing file inside an allowed root."""
+    if not isinstance(path, str) or not path or len(path) > 2048:
+        return False
+    if ".." in path.replace("\\", "/").split("/"):
+        return False
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    if not os.path.isfile(real):
+        return False
+    return any(real == root or real.startswith(root + os.sep) for root in _allowed_wordlist_roots())
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +229,7 @@ class HttpxAdapter:
         if tech_detect:
             cmd.append("-tech-detect")
 
-        if input_list and os.path.isfile(input_list):
+        if input_list and _is_allowed_wordlist_path(input_list):
             cmd += ["-l", input_list]
         else:
             cmd += ["-u", target]
@@ -354,7 +395,7 @@ class DnsxAdapter:
             if rtype in ("a", "aaaa", "cname", "mx", "ns", "txt", "soa", "ptr"):
                 cmd.append(f"-{rtype}")
 
-        if wordlist and os.path.isfile(wordlist):
+        if wordlist and _is_allowed_wordlist_path(wordlist):
             cmd += ["-w", wordlist, "-d", domain]
         else:
             cmd += ["-d", domain]
@@ -450,7 +491,7 @@ class FfufAdapter:
 
         cmd = ["ffuf", "-u", url, "-o", "/dev/stdout", "-of", "json", "-silent"]
 
-        if wordlist and os.path.isfile(wordlist):
+        if wordlist and _is_allowed_wordlist_path(wordlist):
             cmd += ["-w", wordlist]
         else:
             cmd += ["-w", "-"]  # stdin
@@ -662,6 +703,10 @@ class GobusterAdapter:
         if not self.is_available():
             return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="gobuster not installed")
 
+        # SEC-003: mode is a subcommand positional — restrict to the known set.
+        if mode not in ("dir", "dns", "vhost"):
+            return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="Invalid mode")
+
         cmd = ["gobuster", mode, "-q", "--no-color"]
 
         if mode == "dir":
@@ -671,7 +716,7 @@ class GobusterAdapter:
         elif mode == "vhost":
             cmd += ["-u", target]
 
-        if wordlist and os.path.isfile(wordlist):
+        if wordlist and _is_allowed_wordlist_path(wordlist):
             cmd += ["-w", wordlist]
 
         if extensions and mode == "dir":
@@ -775,7 +820,7 @@ class FeroxbusterAdapter:
 
         cmd = ["feroxbuster", "-u", target, "--silent", "--json", "-d", str(depth), "--no-state"]
 
-        if wordlist and os.path.isfile(wordlist):
+        if wordlist and _is_allowed_wordlist_path(wordlist):
             cmd += ["-w", wordlist]
 
         if extensions:
@@ -854,10 +899,15 @@ class MasscanAdapter:
         if not self.is_available():
             return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="masscan not installed")
 
+        # SEC-003: target is the FIRST positional — validate against flag
+        # injection (e.g. "--conf" loading an attacker file).
+        if not _is_safe_target_arg(target):
+            return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="Invalid target (flag injection or unsafe)")
+
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tmp:
             json_path = tmp.name
 
-        cmd = ["masscan", target, "-p", ports, "--rate", str(rate), "-oJ", json_path]
+        cmd = ["masscan", target, "-p", ports, "--rate", str(int(rate)), "-oJ", json_path]
 
         exit_code, stdout, stderr, duration = _run_command(cmd, timeout=timeout)
 
@@ -1033,6 +1083,10 @@ class HakrawlerAdapter:
         if not self.is_available():
             return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="hakrawler not installed")
 
+        # SEC-003: scope is a fixed enum, not free input.
+        if scope not in ("strict", "subs", "fuzzy"):
+            return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="Invalid scope")
+
         cmd = ["hakrawler", "-url", target, "-depth", str(depth), "-scope", scope, "-plain"]
 
         exit_code, stdout, stderr, duration = _run_command(cmd, timeout=timeout)
@@ -1086,10 +1140,15 @@ class ArjunAdapter:
         if not self.is_available():
             return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="arjun not installed")
 
+        # SEC-003: method is a fixed enum, not free input.
+        method_norm = str(method or "GET").upper()
+        if method_norm not in ("GET", "POST", "JSON", "XML"):
+            return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="Invalid method")
+
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tmp:
             json_path = tmp.name
 
-        cmd = ["arjun", "-u", target, "-m", method.upper(), "-oJ", json_path]
+        cmd = ["arjun", "-u", target, "-m", method_norm, "-oJ", json_path]
 
         exit_code, stdout, stderr, duration = _run_command(cmd, timeout=timeout)
 
@@ -1404,7 +1463,16 @@ class ReconArsenal:
                 success=False,
                 error=f"Unknown tool: {tool_name}",
             )
-        return adapter.run(target, **kwargs)
+        result = adapter.run(target, **kwargs)
+        # SEC-013: centrally tag simulation-stub output so API consumers
+        # can never mistake it for real tool results.
+        try:
+            from core.tool_runtime import is_simulated_tool
+
+            result.simulated = bool(is_simulated_tool(tool_name))
+        except Exception:
+            result.simulated = False
+        return result
 
     def run_subdomain_enum(self, domain: str) -> Dict[str, ToolResult]:
         """Run all available subdomain enumeration tools."""

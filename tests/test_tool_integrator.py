@@ -390,3 +390,83 @@ class TestFfufAdapter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSimulatedToolGating(unittest.TestCase):
+    """SEC-013 regression: bundled simulation stubs must be fail-closed."""
+
+    def test_simulation_stubs_not_resolved_by_default(self):
+        import os
+        from unittest.mock import patch as _patch
+        from core.tool_runtime import ToolRuntime
+
+        with _patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ATOMIC_ALLOW_SIMULATED_TOOLS", None)
+            rt = ToolRuntime()
+            # manifest marks every bundled entry as portable_wrapper
+            if rt._manifest and any(s.source == "portable_wrapper" for s in rt._manifest.values()):
+                name = next(n for n, s in rt._manifest.items() if s.source == "portable_wrapper")
+                self.assertTrue(rt.is_simulated(name))
+                self.assertIsNone(rt.bundled_path(name), "simulation stub must not resolve by default")
+
+    def test_simulation_stubs_resolve_when_enabled(self):
+        import os
+        from unittest.mock import patch as _patch
+        from core.tool_runtime import ToolRuntime
+
+        with _patch.dict(os.environ, {"ATOMIC_ALLOW_SIMULATED_TOOLS": "1"}):
+            rt = ToolRuntime()
+            sims = [n for n, s in rt._manifest.items() if s.source == "portable_wrapper"]
+            if sims:
+                self.assertIsNotNone(rt.bundled_path(sims[0]))
+                self.assertTrue(rt.is_effectively_simulated(sims[0]))
+
+    def test_engine_never_converts_simulated_findings(self):
+        """Even with simulation enabled, fabricated output must not become findings."""
+        import os
+        from unittest.mock import patch as _patch
+
+        with _patch.dict(os.environ, {"ATOMIC_ALLOW_SIMULATED_TOOLS": "1"}):
+            from core import engine as engine_mod
+
+            class _Res:
+                success = True
+                findings = [{"type": "open_port", "port": 80, "protocol": "tcp"}]
+
+            eng = engine_mod.AtomicEngine.__new__(engine_mod.AtomicEngine)
+            eng.config = {"auto_external_tools": True, "verbose": False, "quiet": True}
+            eng.findings = []
+            eng._findings_lock = __import__("threading").Lock()
+            eng.db = None
+            eng.full_attacker = None
+            eng.pipeline = {"phase": "scan", "partition": "scan", "events": [],
+                            "recon": {"status": "pending", "data": {}},
+                            "scan": {"status": "pending", "data": {}},
+                            "exploit": {"status": "pending", "data": {}},
+                            "collect": {"status": "pending", "data": {}}}
+            eng._ws_callback = None
+            eng.scan_id = "sim-test"
+
+            class _FakeTools:
+                def run_recon_suite(self, target, domain=""):
+                    return {"amass": _Res()}
+
+                def run_vuln_scan(self, target):
+                    return {}
+
+            eng.tools = _FakeTools()
+            eng.recon_arsenal = None
+
+            def _fake_add_finding(f):
+                eng.findings.append(f)
+
+            eng.add_finding = _fake_add_finding
+            eng.emit_pipeline_event = lambda *a, **kw: None
+
+            with _patch.object(engine_mod, "is_simulated_tool", create=True):
+                pass
+            # Patch the runtime helper used inside the method
+            import core.tool_runtime as tr
+            with _patch.object(tr.RUNTIME, "is_effectively_simulated", return_value=True):
+                eng._run_external_tools_auto("http://target.test")
+            self.assertEqual(eng.findings, [], "simulated tool output must not become findings")

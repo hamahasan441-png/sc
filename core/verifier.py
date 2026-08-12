@@ -210,11 +210,23 @@ class Verifier:
         if "time-based" in technique_lower or "blind" in technique_lower:
             return elapsed >= 4.0, resp_len
 
+        evidence_lower = finding.evidence.lower()
         if "error" in technique_lower:
-            evidence_lower = finding.evidence.lower()
             if "error" in evidence_lower:
                 keywords = ["sql", "syntax", "mysql", "postgresql", "oracle", "sqlite", "mssql"]
                 return any(kw in response_text for kw in keywords), resp_len
+
+        # ERROR-BASED FIX: error-driven findings are frequently labeled by
+        # the database family ("SQL Injection (MYSQL)", "… (Stacked
+        # Queries)", "… (WAF Bypass)") rather than the word "error", so the
+        # branch above missed them and every genuine error-based SQLi
+        # finding was dropped during verification (false negatives).
+        # Route on the evidence instead: when the recorded evidence is an
+        # error indicator, re-confirmation means the error signature is
+        # still present in the re-test response.
+        if "sql injection" in technique_lower and "error" in evidence_lower:
+            keywords = ["sql", "syntax", "mysql", "postgresql", "oracle", "sqlite", "mssql"]
+            return any(kw in response_text for kw in keywords), resp_len
 
         if "xss" in technique_lower or "reflected" in technique_lower:
             return finding.payload in response.text, resp_len

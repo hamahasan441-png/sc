@@ -246,6 +246,33 @@ class AtomicEngine:
             # Older Requester implementations without the hook — nothing to do.
             pass
 
+        # SECURITY (SEC-005): attach the centralized network policy when it
+        # is active (allowed domains configured and/or private-target
+        # blocking enabled).  Every request URL and redirect hop is then
+        # validated inside the Requester.  Inactive policy (no constraints
+        # configured) leaves behavior unchanged for operator-driven scans.
+        self.net_policy = None
+        try:
+            from core.netpolicy import NetworkSecurityPolicy
+
+            scope_domains = (self.config.get("scope") or {}).get("allowed_domains") or []
+            policy = NetworkSecurityPolicy.from_env()
+            if scope_domains and not policy.allowed_domains:
+                policy = NetworkSecurityPolicy(
+                    allowed_domains=list(scope_domains),
+                    block_private=policy.block_private,
+                )
+            if policy.active:
+                self.net_policy = policy
+                self.requester.attach_network_policy(policy)
+                logger.info(
+                    "Network policy active (domains=%s, block_private=%s)",
+                    sorted(policy.allowed_domains) or "-",
+                    policy.block_private,
+                )
+        except Exception as exc:
+            logger.debug("Network policy unavailable: %s", exc)
+
         # --- Philosophy layer (opt-in) ---
         # When config["philosophy"] is true, attach the reasoning layer
         # that adds: falsifiable hypotheses with Bayesian belief updates,
@@ -567,15 +594,27 @@ class AtomicEngine:
         domain = urlparse(target).hostname or ""
         all_results = {}
 
+        # OBSERVABILITY (SEC-011): external-tool failures are scan-
+        # completeness events, not verbose-only noise.  They are classified
+        # and logged structurally so a missing tool phase is diagnosable
+        # after the fact instead of vanishing silently.
         try:
             all_results.update(self.tools.run_recon_suite(target, domain=domain))
         except Exception as exc:
+            logger.warning(
+                "external_tools failure",
+                extra={"phase": "recon_suite", "target": target, "classification": "recoverable", "error": str(exc)},
+            )
             if self.config.get("verbose"):
                 print(f"{Colors.warning(f'External recon suite error: {exc}')}")
 
         try:
             all_results.update(self.tools.run_vuln_scan(target))
         except Exception as exc:
+            logger.warning(
+                "external_tools failure",
+                extra={"phase": "vuln_scan", "target": target, "classification": "recoverable", "error": str(exc)},
+            )
             if self.config.get("verbose"):
                 print(f"{Colors.warning(f'External vuln suite error: {exc}')}")
 
@@ -585,14 +624,31 @@ class AtomicEngine:
                 arsenal_results = self.recon_arsenal.run_full_recon(target, domain=domain)
                 all_results.update(arsenal_results)
             except Exception as exc:
+                logger.warning(
+                    "external_tools failure",
+                    extra={"phase": "recon_arsenal", "target": target, "classification": "recoverable", "error": str(exc)},
+                )
                 if self.config.get("verbose"):
                     print(f"{Colors.warning(f'Recon arsenal error: {exc}')}")
 
         if all_results:
+            # SECURITY FIX (SEC-013, defense in depth): simulation stub
+            # output must never become findings, even when simulation mode
+            # is enabled — fabricated data is for workflow demos only.
+            try:
+                from core.tool_runtime import is_simulated_tool as _is_sim_tool
+            except Exception:
+                def _is_sim_tool(_name):
+                    return False
+
             # Convert tool findings into engine findings so framework uses them
             converted = 0
+            skipped_simulated = []
             for tool_name, res in all_results.items():
                 if not getattr(res, "success", False):
+                    continue
+                if _is_sim_tool(tool_name):
+                    skipped_simulated.append(tool_name)
                     continue
                 for f in getattr(res, "findings", []) or []:
                     try:
@@ -639,6 +695,11 @@ class AtomicEngine:
                         continue
 
             results = [res for res in all_results.values() if hasattr(res, "success")]
+            if skipped_simulated:
+                logger.info(
+                    "External tools: skipped findings conversion for simulated tools: %s",
+                    ", ".join(sorted(skipped_simulated)),
+                )
             self.emit_pipeline_event(
                 "external_tools_completed",
                 {
@@ -646,6 +707,7 @@ class AtomicEngine:
                     "success_count": sum(1 for r in results if r.success),
                     "failure_count": sum(1 for r in results if not r.success),
                     "findings_converted": converted,
+                    "simulated_skipped": sorted(skipped_simulated),
                 },
             )
             if self.config.get("verbose"):

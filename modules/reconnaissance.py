@@ -137,7 +137,7 @@ class ReconModule:
         """Detect technologies from HTTP headers and body."""
         try:
             response = self.requester.request(url, "GET")
-            if not response:
+            if response is None:
                 return
 
             tech: List[str] = []
@@ -311,7 +311,7 @@ class ReconModule:
         """Audit HTTP security headers"""
         try:
             response = self.requester.request(url, "GET")
-            if not response:
+            if response is None:
                 return
 
             headers = response.headers
@@ -413,7 +413,7 @@ class ReconModule:
         """Detect cloud storage assets (S3, Azure Blobs, GCP)"""
         try:
             response = self.requester.request(url, "GET")
-            if not response:
+            if response is None:
                 return
 
             text = response.text
@@ -851,7 +851,7 @@ class ReconModule:
         """
         try:
             resp = self.requester.request(url, "OPTIONS")
-            if not resp:
+            if resp is None:
                 return
             headers = resp.headers
         except Exception as e:
@@ -986,7 +986,7 @@ class ReconModule:
                 resp = self.requester.request(
                     base_url, "GET", headers={"Host": fqdn}
                 )
-                if not resp:
+                if resp is None:
                     continue
 
                 resp_length = len(resp.text) if resp.text else 0
