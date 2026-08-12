@@ -2446,7 +2446,9 @@ def auth_login():
     if not body or not body.get("username") or not body.get("password"):
         return jsonify({"status": "error", "data": "Missing username or password"}), 400
     try:
-        result = _user_store.authenticate(body["username"], body["password"])
+        result = _user_store.authenticate(
+            body["username"], body["password"], client_ip=request.remote_addr or ""
+        )
         if not result:
             return jsonify({"status": "error", "data": "Invalid credentials"}), 401
         return jsonify({"status": "success", "data": result})
@@ -4964,7 +4966,7 @@ def export_scan_findings(scan_id):
 # ---------------------------------------------------------------------------
 
 
-def create_app(host="0.0.0.0", port=5000, debug=False):
+def create_app(host="127.0.0.1", port=5000, debug=False):
     """Configure and return the Flask application and a convenience runner."""
     app.config["HOST"] = host
     app.config["PORT"] = port

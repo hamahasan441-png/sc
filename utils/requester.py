@@ -5,6 +5,7 @@ ATOMIC FRAMEWORK
 Advanced HTTP request handler with evasion, response caching, and metrics
 """
 
+import hashlib
 import logging
 import os
 import random
@@ -669,10 +670,12 @@ class Requester:
             )
         )
 
-    def _make_cache_key(self, url: str, method: str, data: dict) -> str:
+    def _make_cache_key(self, url: str, method: str, data: dict, headers=None) -> str:
         """Build a deterministic cache key for a request.
 
-        Only GET requests with dict data are cacheable (baseline/recon probes).
+        Only GET requests are cacheable (baseline/recon probes).
+        Auth-bearing headers are hashed into the key so two callers
+        with different cookies/tokens never share a cached body.
         Returns empty string for non-cacheable requests.
         """
         if method.upper() != "GET":
@@ -680,9 +683,20 @@ class Requester:
         parts = [url]
         if data and isinstance(data, dict):
             parts.append(str(sorted(data.items())))
+        auth_scope = ""
+        if headers and isinstance(headers, dict):
+            # Case-insensitive lookup; hash so the key does not retain secrets.
+            lowered = {str(k).lower(): str(v) for k, v in headers.items()}
+            scope_bits = []
+            for name in ("authorization", "cookie", "proxy-authorization"):
+                if name in lowered and lowered[name]:
+                    scope_bits.append(f"{name}={lowered[name]}")
+            if scope_bits:
+                auth_scope = hashlib.sha256("|".join(scope_bits).encode("utf-8")).hexdigest()[:16]
+        parts.append(auth_scope or "anon")
         return "|".join(parts)
 
-    def _check_cache(self, url: str, method: str, data, files) -> tuple:
+    def _check_cache(self, url: str, method: str, data, files, headers=None) -> tuple:
         """Check response cache for GET requests.
 
         Returns (cache_key, cached_response).  *cached_response* is ``None``
@@ -690,7 +704,7 @@ class Requester:
         """
         cache_key = ""
         if self._cache_enabled and method.upper() == "GET" and not files:
-            cache_key = self._make_cache_key(url, method, data)
+            cache_key = self._make_cache_key(url, method, data, headers=headers)
             if cache_key:
                 cached = self._cache.get(cache_key)
                 if cached is not None:
