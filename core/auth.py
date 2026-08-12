@@ -368,7 +368,9 @@ class UserStore:
         self.token_manager = TokenManager(require_explicit_secret=secure_bootstrap)
         self._auth_lock = threading.Lock()
         self._failed_logins: Dict[str, list[float]] = {}
+        self._failed_logins_by_ip: Dict[str, list[float]] = {}
         self._login_max_failures = max(1, int(os.environ.get("ATOMIC_LOGIN_MAX_FAILURES", "5")))
+        self._login_max_failures_ip = max(1, int(os.environ.get("ATOMIC_LOGIN_MAX_FAILURES_IP", "20")))
         self._login_window_seconds = max(10, int(os.environ.get("ATOMIC_LOGIN_WINDOW", "300")))
         self._ensure_default_admin()
 
@@ -382,8 +384,13 @@ class UserStore:
                 # key (ATOMIC_API_KEY) or by supplying ATOMIC_ADMIN_PASSWORD.
                 return
             if not default_pw:
-                # Explicit development-only convenience. Never use this in production.
-                default_pw = "Admin@1234"
+                # Never ship a known default password. Dev bootstrap is
+                # opt-in via ATOMIC_ALLOW_DEV_BOOTSTRAP=1 and generates a
+                # random one-time password (never Admin@1234).
+                allow_dev = os.environ.get("ATOMIC_ALLOW_DEV_BOOTSTRAP", "").strip().lower()
+                if allow_dev not in {"1", "true", "yes", "on"}:
+                    return
+                default_pw = secrets.token_urlsafe(18) + "Aa1"
             self.create_user("admin", default_pw, "admin")
 
     def create_user(self, username: str, password: str, role: str = "viewer") -> Optional[User]:
@@ -404,14 +411,20 @@ class UserStore:
         self._users[username] = user
         return user
 
-    def authenticate(self, username: str, password: str) -> Optional[dict]:
+    def authenticate(self, username: str, password: str, client_ip: str = "") -> Optional[dict]:
         """Authenticate with bounded brute-force protection and issue tokens."""
         now = time.time()
+        ip = (client_ip or "").strip()
         with self._auth_lock:
             failures = [t for t in self._failed_logins.get(username, []) if now - t <= self._login_window_seconds]
             self._failed_logins[username] = failures
             if len(failures) >= self._login_max_failures:
                 return None
+            if ip:
+                ip_fails = [t for t in self._failed_logins_by_ip.get(ip, []) if now - t <= self._login_window_seconds]
+                self._failed_logins_by_ip[ip] = ip_fails
+                if len(ip_fails) >= self._login_max_failures_ip:
+                    return None
 
         user = self._users.get(username)
         if not user or not user.is_active or not verify_password(password, user.password_hash):
@@ -419,10 +432,16 @@ class UserStore:
                 failures = self._failed_logins.setdefault(username, [])
                 failures.append(now)
                 self._failed_logins[username] = failures[-self._login_max_failures :]
+                if ip:
+                    ip_fails = self._failed_logins_by_ip.setdefault(ip, [])
+                    ip_fails.append(now)
+                    self._failed_logins_by_ip[ip] = ip_fails[-self._login_max_failures_ip :]
             return None
 
         with self._auth_lock:
             self._failed_logins.pop(username, None)
+            if ip:
+                self._failed_logins_by_ip.pop(ip, None)
         user.last_login = datetime.now(timezone.utc).isoformat()
         return {
             "access_token": self.token_manager.create_access_token(username, user.role),

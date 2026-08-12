@@ -232,6 +232,18 @@ class PluginManager:
             with self._lock:
                 self._plugins[plugin_info.name] = plugin_info
 
+            try:
+                from core.audit_logger import AuditLogger
+
+                AuditLogger().log_config(
+                    "plugin.loaded",
+                    result="ok",
+                    plugin=plugin_info.name,
+                    path=plugin_path,
+                )
+            except Exception:
+                pass
+
             return plugin_info
         except Exception:
             return None
