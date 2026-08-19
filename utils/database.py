@@ -5,6 +5,8 @@ ATOMIC FRAMEWORK - Database Module
 SQLite/SQLAlchemy database operations
 """
 
+import os
+
 try:
     from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Text, ForeignKey
     from sqlalchemy.orm import sessionmaker, declarative_base
@@ -155,11 +157,34 @@ class Database:
 
         if SQLALCHEMY_AVAILABLE:
             try:
+                sqlite_path = self._prepare_sqlite_path(Config.DB_URL)
                 self.engine = create_engine(Config.DB_URL)
                 Base.metadata.create_all(self.engine)
                 self.Session = sessionmaker(bind=self.engine)
+                if sqlite_path:
+                    os.chmod(sqlite_path, 0o600)
             except Exception as e:
                 print(f"[!] Database error: {e}")
+
+    @staticmethod
+    def _prepare_sqlite_path(db_url):
+        """Create a private SQLite parent and reject a symlink database file."""
+        prefix = "sqlite:///"
+        if not isinstance(db_url, str) or not db_url.startswith(prefix):
+            return None
+        path = db_url[len(prefix):]
+        if not path or path == ":memory:":
+            return None
+        path = os.path.abspath(path)
+        directory = os.path.dirname(path)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        if os.path.islink(path):
+            raise RuntimeError("SQLite database must not be a symlink")
+        return path
 
     def save_scan(self, **kwargs):
         """Save scan metadata"""
@@ -291,8 +316,8 @@ class Database:
         except Exception as e:
             print(f"[!] Error saving shell: {e}")
 
-    def get_shells(self):
-        """Get all active shells"""
+    def get_shells(self, include_secret=False):
+        """Get active shells; command parameters are redacted by default."""
         if not self.Session:
             return []
 
@@ -305,7 +330,9 @@ class Database:
                     "url": s.url,
                     "shell_type": s.shell_type,
                     "password": "********" if s.password else None,
+                    "command_parameter": s.password if include_secret else None,
                     "created_at": s.created_at,
+                    "last_used": s.last_used,
                 }
                 for s in shells
             ]

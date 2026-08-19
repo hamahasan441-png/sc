@@ -32,12 +32,75 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-AUTH_SECRET = os.environ.get("ATOMIC_AUTH_SECRET", "").strip()
-AUTH_SECRET_CONFIGURED = bool(AUTH_SECRET)
+def _secure_data_root() -> str:
+    """Return the private ATOMIC data directory and enforce mode ``0700``."""
+    root = os.environ.get("ATOMIC_HOME", "").strip()
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".atomic")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    return root
+
+
+def _load_or_create_auth_secret() -> tuple[str, bool]:
+    """Load a configured JWT secret or create a persistent private one.
+
+    First-run web setup must work without asking the operator to edit an env
+    file.  The generated secret is stored outside the source tree with mode
+    ``0600`` and is stable across restarts.  Environment configuration still
+    takes precedence for managed deployments.
+    """
+    configured = os.environ.get("ATOMIC_AUTH_SECRET", "").strip()
+    if configured:
+        return configured, True
+
+    try:
+        secret_path = os.environ.get("ATOMIC_AUTH_SECRET_FILE", "").strip()
+        if not secret_path:
+            secret_path = os.path.join(_secure_data_root(), "auth_secret")
+        if os.path.islink(secret_path):
+            raise RuntimeError("ATOMIC auth secret file must not be a symlink")
+        try:
+            with open(secret_path, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+            if len(value) >= 32:
+                try:
+                    os.chmod(secret_path, 0o600)
+                except OSError:
+                    pass
+                return value, True
+        except FileNotFoundError:
+            pass
+
+        value = secrets.token_hex(48)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(secret_path, flags, 0o600)
+        except FileExistsError:
+            with open(secret_path, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+            if len(value) < 32:
+                raise RuntimeError("Existing ATOMIC auth secret is too short")
+            return value, True
+        try:
+            os.write(fd, (value + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return value, True
+    except Exception:
+        # Fail-safe development fallback. Secure bootstrap detects the false
+        # flag and refuses token issuance instead of silently trusting it.
+        return secrets.token_hex(48), False
+
+
+AUTH_SECRET, AUTH_SECRET_CONFIGURED = _load_or_create_auth_secret()
 AUTH_SECRET_MIN_LENGTH = 32
-if not AUTH_SECRET:
-    # Ephemeral secret is acceptable only for explicit development/test mode.
-    AUTH_SECRET = secrets.token_hex(32)
 
 AUTH_REQUIRED = os.environ.get("ATOMIC_AUTH_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
 TOKEN_EXPIRY_SECONDS = int(os.environ.get("ATOMIC_TOKEN_EXPIRY", "3600"))
@@ -46,6 +109,7 @@ TOKEN_ISSUER = os.environ.get("ATOMIC_TOKEN_ISSUER", "atomic-security")
 TOKEN_AUDIENCE = os.environ.get("ATOMIC_TOKEN_AUDIENCE", "atomic-api")
 API_KEY_PREFIX = "atk_"
 PASSWORD_MIN_LENGTH = 8
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +224,12 @@ PERMISSIONS = {
     },
 }
 
+# The local owner/admin is intentionally future-proof: any permission added by
+# a module in a later release is available immediately after login. Other roles
+# remain least-privilege and use the explicit matrix above.
+ALL_PERMISSIONS = frozenset().union(*PERMISSIONS.values())
+PERMISSIONS["admin"] = set(ALL_PERMISSIONS) | {"owner.all"}
+
 
 # ---------------------------------------------------------------------------
 # Password hashing (scrypt — computationally expensive, no C dependencies)
@@ -246,7 +316,7 @@ class User:
 
     def has_permission(self, permission: str) -> bool:
         """Check if the user's role grants a specific permission."""
-        return permission in PERMISSIONS.get(self.role, set())
+        return self.role == "admin" or permission in PERMISSIONS.get(self.role, set())
 
 
 # ---------------------------------------------------------------------------
@@ -362,17 +432,104 @@ class TokenManager:
 class UserStore:
     """Manage user accounts with in-memory cache and optional DB persistence."""
 
-    def __init__(self, secure_bootstrap: bool = False):
+    def __init__(self, secure_bootstrap: bool = False, persistent: bool = False):
         self._secure_bootstrap = secure_bootstrap
         self._users: Dict[str, User] = {}
         self.token_manager = TokenManager(require_explicit_secret=secure_bootstrap)
+        self._store_lock = threading.RLock()
         self._auth_lock = threading.Lock()
         self._failed_logins: Dict[str, list[float]] = {}
         self._failed_logins_by_ip: Dict[str, list[float]] = {}
         self._login_max_failures = max(1, int(os.environ.get("ATOMIC_LOGIN_MAX_FAILURES", "5")))
         self._login_max_failures_ip = max(1, int(os.environ.get("ATOMIC_LOGIN_MAX_FAILURES_IP", "20")))
         self._login_window_seconds = max(10, int(os.environ.get("ATOMIC_LOGIN_WINDOW", "300")))
+        configured_store = os.environ.get("ATOMIC_USERS_FILE", "").strip()
+        self._persistent = bool(persistent or configured_store)
+        self._storage_path = configured_store
+        if self._persistent and not self._storage_path:
+            self._storage_path = os.path.join(_secure_data_root(), "users.json")
+        self._load_users()
         self._ensure_default_admin()
+
+    @property
+    def needs_bootstrap(self) -> bool:
+        """True until the first owner account has been created."""
+        with self._store_lock:
+            return not bool(self._users)
+
+    def _load_users(self) -> None:
+        """Load users from the private on-disk store."""
+        with self._store_lock:
+            if not self._persistent:
+                return
+            if not os.path.exists(self._storage_path):
+                return
+            if os.path.islink(self._storage_path):
+                raise RuntimeError("ATOMIC user store must not be a symlink")
+            with open(self._storage_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            loaded: Dict[str, User] = {}
+            for row in payload.get("users", []):
+                username = str(row.get("username", ""))
+                role = str(row.get("role", "viewer"))
+                if not USERNAME_RE.fullmatch(username) or role not in ROLES:
+                    continue
+                password_hash = str(row.get("password_hash", ""))
+                if not password_hash.startswith("scrypt:"):
+                    continue
+                loaded[username] = User(
+                    username=username,
+                    password_hash=password_hash,
+                    role=role,
+                    api_key_hash=str(row.get("api_key_hash", "")),
+                    created_at=str(row.get("created_at", "")),
+                    last_login=str(row.get("last_login", "")),
+                    is_active=bool(row.get("is_active", True)),
+                )
+            self._users = loaded
+            try:
+                os.chmod(self._storage_path, 0o600)
+            except OSError:
+                pass
+
+    def _persist_users(self) -> None:
+        """Atomically persist users without ever exposing password hashes."""
+        if not self._persistent:
+            return
+        directory = os.path.dirname(os.path.abspath(self._storage_path))
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        payload = {
+            "version": 1,
+            "users": [
+                {
+                    "username": user.username,
+                    "password_hash": user.password_hash,
+                    "role": user.role,
+                    "api_key_hash": user.api_key_hash,
+                    "created_at": user.created_at,
+                    "last_login": user.last_login,
+                    "is_active": user.is_active,
+                }
+                for user in sorted(self._users.values(), key=lambda item: item.username)
+            ],
+        }
+        data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        temp_path = f"{self._storage_path}.tmp-{secrets.token_hex(8)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(temp_path, flags, 0o600)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp_path, self._storage_path)
+        os.chmod(self._storage_path, 0o600)
 
     def _ensure_default_admin(self):
         """Create a default admin account if none exists."""
@@ -393,23 +550,33 @@ class UserStore:
                 default_pw = secrets.token_urlsafe(18) + "Aa1"
             self.create_user("admin", default_pw, "admin")
 
+    def bootstrap_admin(self, password: str, username: str = "admin") -> Optional[User]:
+        """Atomically create the one and only first-run owner account."""
+        with self._store_lock:
+            if self._users:
+                return None
+            return self.create_user(username, password, "admin")
+
     def create_user(self, username: str, password: str, role: str = "viewer") -> Optional[User]:
         """Create a new user. Returns the User or None on failure."""
-        if username in self._users:
-            return None
-        if role not in ROLES:
-            return None
-        strength_error = validate_password_strength(password)
-        if strength_error:
-            return None
-        user = User(
-            username=username,
-            password_hash=hash_password(password),
-            role=role,
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-        self._users[username] = user
-        return user
+        username = str(username or "").strip()
+        with self._store_lock:
+            if not USERNAME_RE.fullmatch(username) or username in self._users:
+                return None
+            if role not in ROLES:
+                return None
+            strength_error = validate_password_strength(password)
+            if strength_error:
+                return None
+            user = User(
+                username=username,
+                password_hash=hash_password(password),
+                role=role,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            self._users[username] = user
+            self._persist_users()
+            return user
 
     def authenticate(self, username: str, password: str, client_ip: str = "") -> Optional[dict]:
         """Authenticate with bounded brute-force protection and issue tokens."""
@@ -443,6 +610,8 @@ class UserStore:
             if ip:
                 self._failed_logins_by_ip.pop(ip, None)
         user.last_login = datetime.now(timezone.utc).isoformat()
+        with self._store_lock:
+            self._persist_users()
         return {
             "access_token": self.token_manager.create_access_token(username, user.role),
             "refresh_token": self.token_manager.create_refresh_token(username, user.role),
@@ -466,6 +635,8 @@ class UserStore:
             return None
         key = generate_api_key()
         user.api_key_hash = hash_api_key(key)
+        with self._store_lock:
+            self._persist_users()
         return key
 
     def get_user(self, username: str) -> Optional[User]:
@@ -485,24 +656,30 @@ class UserStore:
         ]
 
     def update_user_role(self, username: str, new_role: str) -> bool:
-        user = self._users.get(username)
-        if not user or new_role not in ROLES:
-            return False
-        user.role = new_role
-        return True
+        with self._store_lock:
+            user = self._users.get(username)
+            if not user or new_role not in ROLES:
+                return False
+            user.role = new_role
+            self._persist_users()
+            return True
 
     def deactivate_user(self, username: str) -> bool:
-        user = self._users.get(username)
-        if not user:
-            return False
-        user.is_active = False
-        return True
+        with self._store_lock:
+            user = self._users.get(username)
+            if not user:
+                return False
+            user.is_active = False
+            self._persist_users()
+            return True
 
     def delete_user(self, username: str) -> bool:
-        if username in self._users:
-            del self._users[username]
-            return True
-        return False
+        with self._store_lock:
+            if username in self._users:
+                del self._users[username]
+                self._persist_users()
+                return True
+            return False
 
     def validate_request_token(self, token: str) -> Optional[dict]:
         """Validate an access token and resolve the current user/role.

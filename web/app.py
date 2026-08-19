@@ -18,6 +18,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from functools import wraps
+from urllib.parse import urlparse
 
 
 from config import Config
@@ -32,7 +33,7 @@ from utils.database import Database, ScanModel, FindingModel, SQLALCHEMY_AVAILAB
 # ``Flask(__name__, ...)`` two lines later, which produced a confusing
 # ``NameError: Flask is not defined`` instead of the intended
 # "pip install flask" hint.
-from flask import Flask, render_template, request, jsonify, send_from_directory, Response
+from flask import Flask, render_template, request, jsonify, send_from_directory, Response, redirect
 from flask_cors import CORS
 
 FLASK_AVAILABLE = True
@@ -56,9 +57,9 @@ app = Flask(
     template_folder=os.path.join(os.path.dirname(__file__), "templates"),
     static_folder=os.path.join(os.path.dirname(__file__), "static"),
 )
-# Set ATOMIC_SECRET_KEY env var to persist sessions across restarts.
-# Without it a random key is generated on each startup, invalidating sessions.
-app.config["SECRET_KEY"] = os.environ.get("ATOMIC_SECRET_KEY", uuid.uuid4().hex)
+# Replaced with the persistent authentication secret once ``core.auth`` loads.
+# This temporary value is never used for a served request during module import.
+app.config["SECRET_KEY"] = os.environ.get("ATOMIC_SECRET_KEY", secrets.token_hex(48))
 # Correlate every HTTP request without trusting caller-controlled identifiers.
 @app.before_request
 def _request_context_id():
@@ -118,6 +119,10 @@ if SOCKETIO_AVAILABLE:
 _active_scans = {}
 _scans_lock = threading.Lock()
 _MAX_COMPLETED_SCANS = 200  # Purge oldest completed scans beyond this limit
+try:
+    _MAX_CONCURRENT_SCANS = min(16, max(1, int(os.environ.get("ATOMIC_MAX_CONCURRENT_SCANS", "4"))))
+except ValueError:
+    _MAX_CONCURRENT_SCANS = 4
 
 # ---------------------------------------------------------------------------
 # In-memory chat store for team collaboration on the dashboard
@@ -140,6 +145,15 @@ _SAFE_SCAN_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 _API_KEY = os.environ.get("ATOMIC_API_KEY", "").strip()
 _AUTH_REQUIRED = os.environ.get("ATOMIC_AUTH_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
+_OWNER_MODE = os.environ.get("ATOMIC_OWNER_MODE", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _bootstrap_required() -> bool:
+    """Return True until the first persistent owner account exists."""
+    try:
+        return bool(_AUTH_REQUIRED and _user_store is not None and _user_store.needs_bootstrap)
+    except Exception:
+        return bool(_AUTH_REQUIRED)
 
 
 def _get_current_user():
@@ -184,6 +198,8 @@ def _require_api_key(f):
     def decorated(*args, **kwargs):
         if not _AUTH_REQUIRED or app.config.get("TESTING"):
             return f(*args, **kwargs)
+        if _bootstrap_required():
+            return jsonify({"status": "error", "data": "Initial owner setup required"}), 428
         if _get_current_user() is None:
             return jsonify({"status": "error", "data": "Authentication required"}), 401
         return f(*args, **kwargs)
@@ -245,11 +261,13 @@ def _require_permission(permission):
         def decorated(*args, **kwargs):
             if not _AUTH_REQUIRED or app.config.get("TESTING"):
                 return f(*args, **kwargs)
+            if _bootstrap_required():
+                return jsonify({"status": "error", "data": "Initial owner setup required"}), 428
             user = _get_current_user()
             if user is None:
                 return jsonify({"status": "error", "data": "Authentication required"}), 401
             role = user.get("role", "")
-            if permission not in PERMISSIONS.get(role, set()):
+            if role != "admin" and permission not in PERMISSIONS.get(role, set()):
                 return jsonify({"status": "error", "data": "Forbidden"}), 403
             return f(*args, **kwargs)
         return decorated
@@ -529,6 +547,12 @@ _SHELL_DANGEROUS_FLAGS = frozenset({
 # here.) Over-broad on purpose: e.g. ``echo exec`` is also rejected, which
 # is an acceptable price for a security allowlist.
 _SHELL_DANGEROUS_SUBCOMMANDS = frozenset({"exec", "execdir"})
+_SHELL_MUTATING_TOKENS = frozenset({
+    "add", "del", "delete", "set", "replace", "change", "append", "flush",
+    "up", "down", "master", "nomaster", "name", "alias", "unalias",
+    "-s", "--set", "--set-systz", "--settimeofday", "netns", "-batch",
+    "-force", "--force",
+})
 
 
 def _is_shell_command_allowed(cmd: str) -> bool:
@@ -575,6 +599,29 @@ def _is_shell_command_allowed(cmd: str) -> bool:
     if base_cmd not in SHELL_COMMAND_ALLOWLIST:
         return False
 
+    lowered_args = [tok.lower() for tok in tokens[1:]]
+    if base_cmd in {"ip", "ifconfig", "hostname", "date"} and any(
+        tok.split("=", 1)[0] in _SHELL_MUTATING_TOKENS for tok in lowered_args
+    ):
+        return False
+    # These utilities can mutate state without an obvious verb/flag.
+    if base_cmd == "hostname" and lowered_args:
+        return False
+    if base_cmd == "ifconfig":
+        if len(lowered_args) > 1:
+            return False
+        if lowered_args and not re.fullmatch(r"[a-z][a-z0-9_.:-]{0,31}", lowered_args[0]):
+            return False
+    if base_cmd == "date":
+        for tok in tokens[1:]:
+            if not (
+                tok in {"-u", "--utc", "-r", "--reference"}
+                or tok.startswith("+")
+                or tok.startswith("--iso-8601")
+                or tok.startswith("-I")
+            ):
+                return False
+
     # Inspect every subsequent token for dangerous flags.  A flag may
     # be glued to its value (``--output=foo``) so we compare both the
     # full token and the part before any ``=``.
@@ -589,22 +636,10 @@ def _is_shell_command_allowed(cmd: str) -> bool:
     return True
 
 
-# SECURITY (SEC-009): nonce-free hardening split.  The new SPA (served at
-# "/") is fully file-based, so it gets a CSP WITHOUT 'unsafe-inline' for
-# scripts.  The legacy dashboard relies on inline scripts and keeps the
-# permissive policy, isolated to its own route.
+# The dashboard is fully file-based, so inline scripts stay forbidden.
 _CSP_STRICT = (
     "default-src 'self'; "
     "script-src 'self' https://cdnjs.cloudflare.com; "
-    "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data:; "
-    "connect-src 'self' ws: wss:; "
-    "font-src 'self'; "
-    "object-src 'none'; base-uri 'self'; frame-ancestors 'none';"
-)
-_CSP_LEGACY = (
-    "default-src 'self'; "
-    "script-src 'self' 'unsafe-inline'; "
     "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data:; "
     "connect-src 'self' ws: wss:; "
@@ -619,11 +654,7 @@ def _set_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    path = request.path or ""
-    if path == "/legacy" or path.startswith("/legacy/"):
-        response.headers.setdefault("Content-Security-Policy", _CSP_LEGACY)
-    else:
-        response.headers.setdefault("Content-Security-Policy", _CSP_STRICT)
+    response.headers.setdefault("Content-Security-Policy", _CSP_STRICT)
     # Only set HSTS when served over HTTPS to avoid issues over plain HTTP
     if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
         response.headers.setdefault(
@@ -657,9 +688,17 @@ def _emit_ws(event, data):
 # Module-level component instances (lazy-safe — import errors are caught)
 # ---------------------------------------------------------------------------
 try:
-    from core.auth import UserStore, PERMISSIONS, ROLES, AUTH_SECRET_CONFIGURED
+    from core.auth import (
+        UserStore,
+        PERMISSIONS,
+        ROLES,
+        AUTH_SECRET,
+        AUTH_SECRET_CONFIGURED,
+        validate_password_strength,
+    )
 
-    _user_store = UserStore(secure_bootstrap=True)
+    _user_store = UserStore(secure_bootstrap=True, persistent=True)
+    app.config["SECRET_KEY"] = os.environ.get("ATOMIC_SECRET_KEY", "").strip() or AUTH_SECRET
 except Exception:
     logger.debug("core.auth unavailable — auth endpoints disabled")
     _user_store = None
@@ -954,8 +993,8 @@ def dashboard():
 
 @app.route("/legacy")
 def dashboard_legacy():
-    """Render the legacy single-file dashboard (kept for fallback)."""
-    return render_template("index.html", version=Config.VERSION)
+    """Retired legacy UI: keep old bookmarks working without its unsafe-inline CSP."""
+    return redirect("/", code=308)
 
 
 @app.route("/api/scans", methods=["GET"])
@@ -1068,6 +1107,8 @@ def start_scan():
     if "targets" in body and isinstance(body["targets"], list):
         raw_targets = [t.strip() for t in body["targets"] if isinstance(t, str) and t.strip()]
     elif "target" in body:
+        if not isinstance(body["target"], str):
+            return jsonify({"status": "error", "data": "target must be a string"}), 400
         raw_targets = [body["target"].strip()]
 
     if not raw_targets:
@@ -1117,10 +1158,26 @@ def start_scan():
 
     scan_id = str(uuid.uuid4())[:8]
     modules = body.get("modules", [])
+    if not isinstance(modules, list) or any(not isinstance(item, str) for item in modules):
+        return jsonify({"status": "error", "data": "modules must be a list of names"}), 400
     evasion = body.get("evasion", "none")
     depth = body.get("depth", Config.MAX_DEPTH)
     threads = body.get("threads", Config.MAX_THREADS)
-    full_scan = body.get("full_scan", False)
+    full_scan = bool(body.get("full_scan", _OWNER_MODE))
+
+    if evasion not in Config.EVASION_LEVELS:
+        return jsonify({"status": "error", "data": "Invalid evasion profile"}), 400
+    try:
+        depth = int(depth)
+        threads = int(threads)
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "data": "depth and threads must be integers"}), 400
+    if not 1 <= depth <= 10:
+        return jsonify({"status": "error", "data": "depth must be between 1 and 10"}), 400
+    if not 1 <= threads <= min(100, Config.MAX_THREADS):
+        return jsonify(
+            {"status": "error", "data": f"threads must be between 1 and {min(100, Config.MAX_THREADS)}"}
+        ), 400
 
     all_module_keys = [
         "sqli",
@@ -1137,18 +1194,46 @@ def start_scan():
         "upload",
         "gatebreaker",
         "firewall_bypass",
+        "open_redirect",
+        "crlf",
+        "hpp",
+        "graphql",
+        "proto_pollution",
+        "race_condition",
+        "websocket",
+        "deserialization",
+        "cloud_scan",
+        "osint",
+        "fuzzer",
+        "oauth",
+        "mfa_bypass",
+        "api_versioning",
+        "dep_confusion",
+        "llm_logic",
+        "h2_smuggling",
+        "cache_poisoning",
+        "api_abuse",
+        "deep_scan",
     ]
     modules_dict = {}
     for key in all_module_keys:
         modules_dict[key] = full_scan or (key in modules)
 
-    auto_exploit = body.get("auto_exploit", False)
+    auto_exploit = bool(body.get("auto_exploit", _OWNER_MODE))
     modules_dict.update(
         {
             "recon": full_scan or body.get("recon", False),
             "subdomains": full_scan,
             "tech_detect": full_scan,
             "dir_brute": full_scan,
+            "discovery": full_scan,
+            "browser_scan": full_scan,
+            "passive_recon": full_scan,
+            "enrich": full_scan,
+            "chain_detect": full_scan,
+            "agent_scan": full_scan,
+            "shield_detect": full_scan,
+            "real_ip": full_scan,
             "shell": False,
             "dump": False,
             "os_shell": False,
@@ -1167,31 +1252,64 @@ def start_scan():
     # high-severity findings are LLM-enriched.  Unset / false ⇒ legacy
     # behaviour (no LLM).  Any failure is non-fatal — the scan continues
     # and a warning is emitted via SocketIO ``scan_log``.
-    use_local_llm = bool(body.get("use_local_llm", False))
-    llm_model_raw = (body.get("llm_model") or "").strip()
-    if llm_model_raw and (not _OLLAMA_MODEL_RE.match(llm_model_raw) or ".." in llm_model_raw):
+    use_local_llm = bool(
+        body.get("use_local_llm", _OWNER_MODE and _ollama_available())
+    )
+    llm_model_value = body.get("llm_model") or ""
+    if not isinstance(llm_model_value, str):
+        return jsonify({"status": "error", "data": "Invalid llm_model name"}), 400
+    llm_model_raw = llm_model_value.strip()
+    if llm_model_raw and (
+        len(llm_model_raw) > 128 or not _OLLAMA_MODEL_RE.fullmatch(llm_model_raw) or ".." in llm_model_raw
+    ):
         return jsonify({"status": "error", "data": "Invalid llm_model name"}), 400
     llm_model = llm_model_raw or DEFAULT_OLLAMA_MODEL
 
+    planned_scans = [
+        (scan_id if len(valid_targets) == 1 else f"{scan_id}-{idx}", target)
+        for idx, target in enumerate(valid_targets)
+    ]
+    with _scans_lock:
+        occupied = sum(
+            1 for info in _active_scans.values()
+            if info.get("status") in {"queued", "running"}
+        )
+        if occupied + len(valid_targets) > _MAX_CONCURRENT_SCANS:
+            return jsonify(
+                {
+                    "status": "error",
+                    "data": (
+                        f"Scan capacity exceeded: {occupied} active, "
+                        f"maximum {_MAX_CONCURRENT_SCANS}"
+                    ),
+                }
+            ), 429
+        for tid, target in planned_scans:
+            _active_scans[tid] = {
+                "status": "queued",
+                "target": target,
+                "start_time": None,
+                "findings": 0,
+                "engine": None,
+                "pipeline": {"phase": "init", "events": []},
+            }
+
     # Launch one scan thread per valid target; share the same scan_id prefix
     scan_ids = []
-    for idx, target in enumerate(valid_targets):
-        if len(valid_targets) == 1:
-            tid = scan_id
-        else:
-            tid = f"{scan_id}-{idx}"
-
+    for tid, target in planned_scans:
         config = {
             "target": target,
             "modules": modules_dict,
             "evasion": evasion,
-            "depth": int(depth),
-            "threads": int(threads),
+            "depth": depth,
+            "threads": threads,
             "verbose": False,
             "quiet": True,
             "timeout": Config.TIMEOUT,
             "delay": Config.REQUEST_DELAY,
-            "waf_bypass": False,
+            "waf_bypass": full_scan,
+            "full_bypass": full_scan,
+            "full_attack": auto_exploit,
             "tor": False,
             "proxy": None,
             "rotate_proxy": False,
@@ -1203,6 +1321,10 @@ def start_scan():
             # exploitation when the server itself was started with
             # ATOMIC_AUTHORIZED=1; otherwise auto_exploit stays detection-only.
             "authorized": _scan_authorization_acknowledged(),
+            "strict_scope": True,
+            "scope": {
+                "allowed_domains": [urlparse(target).hostname],
+            },
             # Local LLM (Ollama) — auto-start daemon and pull model in
             # the scan thread when the user opted in.
             "use_local_llm": use_local_llm,
@@ -1210,8 +1332,18 @@ def start_scan():
             "llm_model": llm_model,
         }
 
-        thread = threading.Thread(target=_run_scan, args=(tid, target, config), daemon=True)
-        thread.start()
+        thread = threading.Thread(
+            target=_run_scan,
+            args=(tid, target, config),
+            daemon=True,
+            name=f"atomic-scan-{tid}",
+        )
+        try:
+            thread.start()
+        except Exception:
+            with _scans_lock:
+                _active_scans.pop(tid, None)
+            raise
         scan_ids.append({"scan_id": tid, "target": target})
 
     resp_data = {
@@ -1696,15 +1828,37 @@ def api_sequencer():
 
 
 @app.route("/api/tools/repeater", methods=["POST"])
-@_require_api_key
+@_require_permission("tools.use")
 @_rate_limit
 def api_repeater():
     """Send an HTTP request via the Repeater tool."""
     body = request.get_json(silent=True) or {}
-    method = body.get("method", "GET").upper()
+    method_raw = body.get("method", "GET")
     url = body.get("url", "")
+    if not isinstance(method_raw, str) or method_raw.upper() not in {
+        "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"
+    }:
+        return jsonify({"status": "error", "data": "Invalid HTTP method"}), 400
+    method = method_raw.upper()
+    if not isinstance(url, str) or len(url) > 4096:
+        return jsonify({"status": "error", "data": "Invalid URL"}), 400
     headers = body.get("headers")
     req_body = body.get("body")
+    if headers is not None:
+        if not isinstance(headers, dict) or len(headers) > 100:
+            return jsonify({"status": "error", "data": "Invalid headers"}), 400
+        for key, value in headers.items():
+            if (
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or len(key) > 256
+                or len(value) > 8192
+                or "\r" in key + value
+                or "\n" in key + value
+            ):
+                return jsonify({"status": "error", "data": "Invalid header name or value"}), 400
+    if req_body is not None and not isinstance(req_body, (str, bytes)):
+        return jsonify({"status": "error", "data": "Request body must be text"}), 400
     if not url:
         return jsonify({"status": "error", "data": "Missing url field"}), 400
     if not url.startswith(("http://", "https://")):
@@ -1713,32 +1867,46 @@ def api_repeater():
             url = _normalize(url)
         except (ValueError, TypeError, ImportError):
             return jsonify({"status": "error", "data": "URL must start with http:// or https://"}), 400
-    # SECURITY (SEC-004): the repeater is an authenticated request-sender;
-    # it must honor the same centralized network policy as the scanner
-    # (configured scope + optional private/metadata blocking).
     try:
         from core.netpolicy import NetworkSecurityPolicy
-
         _np = NetworkSecurityPolicy.from_env()
-        if _np.active:
-            allowed, reason = _np.allow_url(url)
-            if not allowed:
-                return (
-                    jsonify(
-                        {
-                            "status": "error",
-                            "data": f"URL blocked by network policy: {reason}",
-                        }
-                    ),
-                    403,
-                )
-    except ImportError:
-        pass
+        # Private/LAN repeater access is available to the local owner only
+        # after an explicit per-request acknowledgement. Public targets keep
+        # the safe default policy without extra clicks.
+        caller = _get_current_user() or {}
+        private_ack = body.get("authorized_target") is True
+        if private_ack and caller.get("role") == "admin" and _scan_authorization_acknowledged():
+            parsed_host = urlparse(url).hostname
+            _np = NetworkSecurityPolicy(
+                allowed_domains=[parsed_host] if parsed_host else [],
+                block_private=True,
+                enforce_domains=True,
+                resolve_dns=True,
+                allow_private_scoped=True,
+            )
+        allowed, reason = _np.allow_url(url)
+        if not allowed:
+            return jsonify({"status": "error", "data": f"URL blocked by network policy: {reason}"}), 403
+    except Exception:
+        logger.exception("Repeater network policy unavailable")
+        return jsonify({"status": "error", "data": "Network policy unavailable"}), 503
     try:
         from core.repeater import Repeater
 
-        rep = Repeater(timeout=15)
-        resp = rep.send(method, url, headers=headers, body=req_body)
+        rep = Repeater(
+            timeout=15,
+            verify_ssl=not bool(body.get("insecure_tls", False)),
+            network_policy=_np,
+            max_response_bytes=1024 * 1024,
+            max_redirects=10,
+        )
+        resp = rep.send(
+            method,
+            url,
+            headers=headers,
+            body=req_body,
+            allow_redirects=body.get("allow_redirects", True) is not False,
+        )
         return jsonify(
             {
                 "status": "success",
@@ -1751,6 +1919,8 @@ def api_repeater():
                 },
             }
         )
+    except PermissionError as exc:
+        return jsonify({"status": "error", "data": str(exc)}), 403
     except Exception as exc:
         return jsonify({"status": "error", "data": str(exc)}), 500
 
@@ -2434,6 +2604,81 @@ def reload_scanner_rules():
 # ---------------------------------------------------------------------------
 
 
+@app.route("/api/auth/setup/status", methods=["GET"])
+@_rate_limit
+def auth_setup_status():
+    """Tell the SPA whether first-run owner creation is required."""
+    if _user_store is None:
+        return jsonify({"status": "error", "data": "Auth module unavailable"}), 503
+    return jsonify(
+        {
+            "status": "success",
+            "data": {
+                "required": bool(_user_store.needs_bootstrap),
+                "owner_mode": bool(_OWNER_MODE),
+                "password_policy": {
+                    "min_length": 8,
+                    "uppercase": True,
+                    "lowercase": True,
+                    "digit": True,
+                },
+            },
+        }
+    )
+
+
+@app.route("/api/auth/setup", methods=["POST"])
+@_rate_limit
+def auth_setup_owner():
+    """Create the persistent first owner and issue login tokens.
+
+    The endpoint is permanently closed after the first successful call.  The
+    JSON/CSRF requirement plus same-origin CORS prevents drive-by browser
+    setup, while the default dashboard bind keeps first-run access local.
+    """
+    if not AUTH_SECRET_CONFIGURED:
+        return jsonify({"status": "error", "data": "Unable to create persistent auth secret"}), 503
+    if _user_store is None:
+        return jsonify({"status": "error", "data": "Auth module unavailable"}), 503
+    if not _user_store.needs_bootstrap:
+        return jsonify({"status": "error", "data": "Owner setup is already complete"}), 409
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"status": "error", "data": "Missing JSON body"}), 400
+    username = str(body.get("username") or "admin").strip()
+    password = body.get("password")
+    confirmation = body.get("password_confirmation")
+    if not isinstance(password, str) or password != confirmation:
+        return jsonify({"status": "error", "data": "Passwords do not match"}), 400
+    strength_error = validate_password_strength(password)
+    if strength_error:
+        return jsonify({"status": "error", "data": strength_error}), 400
+    if body.get("authorized_use") is not True:
+        return jsonify({"status": "error", "data": "Authorized-use acknowledgement is required"}), 400
+    try:
+        owner = _user_store.bootstrap_admin(password=password, username=username)
+        if owner is None:
+            return jsonify({"status": "error", "data": "Owner setup is already complete"}), 409
+        try:
+            from core.authorization import acknowledge_owner_authorization
+
+            acknowledge_owner_authorization(owner.username)
+        except Exception:
+            logger.exception("Could not persist owner authorization acknowledgement")
+            return jsonify({"status": "error", "data": "Could not persist authorization acknowledgement"}), 500
+        result = _user_store.authenticate(
+            owner.username, password, client_ip=request.remote_addr or ""
+        )
+        if not result:
+            return jsonify({"status": "error", "data": "Owner created; login required"}), 201
+        result["owner_mode"] = True
+        result["permissions"] = ["*"]
+        return jsonify({"status": "success", "data": result}), 201
+    except Exception:
+        logger.exception("Initial owner setup failed")
+        return jsonify({"status": "error", "data": "Initial owner setup failed"}), 500
+
+
 @app.route("/api/auth/login", methods=["POST"])
 @_rate_limit
 def auth_login():
@@ -2442,6 +2687,8 @@ def auth_login():
         return jsonify({"status": "error", "data": "ATOMIC_AUTH_SECRET is required for JWT authentication"}), 503
     if _user_store is None:
         return jsonify({"status": "error", "data": "Auth module unavailable"}), 503
+    if _user_store.needs_bootstrap:
+        return jsonify({"status": "error", "data": "Initial owner setup required"}), 428
     body = request.get_json(silent=True)
     if not body or not body.get("username") or not body.get("password"):
         return jsonify({"status": "error", "data": "Missing username or password"}), 400
@@ -2451,6 +2698,9 @@ def auth_login():
         )
         if not result:
             return jsonify({"status": "error", "data": "Invalid credentials"}), 401
+        if result.get("role") == "admin":
+            result["owner_mode"] = True
+            result["permissions"] = ["*"]
         return jsonify({"status": "success", "data": result})
     except Exception:
         return jsonify({"status": "error", "data": "Authentication error"}), 500
@@ -2497,6 +2747,8 @@ def auth_me():
                     "is_active": info.is_active,
                     "created_at": info.created_at,
                     "last_login": info.last_login,
+                    "owner_mode": info.role == "admin",
+                    "permissions": ["*"] if info.role == "admin" else sorted(PERMISSIONS.get(info.role, set())),
                 },
             }
         )
@@ -2814,7 +3066,7 @@ def list_compliance_frameworks():
 
 
 @app.route("/api/audit", methods=["GET"])
-@_require_api_key
+@_require_permission("audit.read")
 @_rate_limit
 def get_audit_entries():
     """Get audit log entries with optional filters."""
@@ -2833,7 +3085,7 @@ def get_audit_entries():
 
 
 @app.route("/api/audit/stats", methods=["GET"])
-@_require_api_key
+@_require_permission("audit.read")
 @_rate_limit
 def get_audit_stats():
     """Get audit log statistics."""
@@ -2851,7 +3103,7 @@ def get_audit_stats():
 
 
 @app.route("/api/tools/external", methods=["GET"])
-@_require_api_key
+@_require_permission("tools.use")
 @_rate_limit
 def list_external_tools():
     """List available external security tools and their status."""
@@ -2867,25 +3119,28 @@ def list_external_tools():
 # SECURITY (SEC-003): API callers may only pass adapter kwargs that are on
 # this allowlist.  Free-form ``**params`` plumbing previously let callers
 # reach file-path and subcommand arguments of the underlying tools.
-_TOOL_PARAM_ALLOWLIST = {
-    # core.tool_integrator adapters
+_TOOL_PARAM_ALLOWLIST_EXTERNAL = {
     "nmap": {"ports", "scan_type", "timeout"},
-    "nuclei": {"templates", "severity", "use_builtin", "timeout"},
+    "nuclei": {"templates", "severity", "tags", "use_builtin", "timeout"},
     "nikto": {"tuning", "timeout"},
     "whatweb": {"aggression", "timeout"},
     "subfinder": {"timeout"},
-    "httpx": {"paths", "follow_redirects", "input_list", "tech_detect", "timeout"},
+    "httpx": {"paths", "follow_redirects", "timeout"},
     "ffuf": {"wordlist", "extensions", "filter_codes", "timeout"},
-    # core.recon_arsenal adapters
+}
+
+_TOOL_PARAM_ALLOWLIST_RECON = {
     "amass": {"mode", "timeout"},
+    "httpx": {"input_list", "tech_detect", "timeout"},
     "dnsx": {"wordlist", "record_types", "timeout"},
     "katana": {"depth", "js_crawl", "timeout"},
-    "gau": {"timeout"},
-    "waybackurls": {"timeout"},
+    "ffuf": {"wordlist", "mode", "extensions", "filter_code", "timeout"},
+    "gau": {"providers", "blacklist", "timeout"},
+    "waybackurls": {"no_subs", "timeout"},
     "paramspider": {"exclude", "timeout"},
     "gobuster": {"mode", "wordlist", "extensions", "timeout"},
     "feroxbuster": {"wordlist", "depth", "extensions", "filter_code", "timeout"},
-    "dirsearch": {"timeout"},
+    "dirsearch": {"extensions", "wordlist", "threads", "timeout"},
     "masscan": {"ports", "rate", "timeout"},
     "rustscan": {"ports", "batch_size", "timeout"},
     "hakrawler": {"depth", "scope", "timeout"},
@@ -2893,9 +3148,116 @@ _TOOL_PARAM_ALLOWLIST = {
 }
 
 
-def _filter_tool_params(tool_name: str, body: dict):
+def _tool_local_path(value, allow_directory=False):
+    if not isinstance(value, str) or not value or len(value) > 2048 or "\x00" in value:
+        return None
+    try:
+        path = os.path.realpath(value)
+        roots = [os.path.realpath(Config.BASE_DIR), os.path.realpath(Config.ATOMIC_HOME)]
+        if not any(path == root or path.startswith(root + os.sep) for root in roots):
+            return None
+        if os.path.islink(value):
+            return None
+        if not (os.path.isfile(path) or (allow_directory and os.path.isdir(path))):
+            return None
+        return path
+    except (OSError, ValueError):
+        return None
+
+
+def _normalize_tool_params(tool_name: str, params: dict):
+    """Type-check and bound adapter parameters before they reach subprocess argv."""
+    cleaned = dict(params)
+    integer_limits = {
+        "timeout": (1, 1800),
+        "depth": (1, 10),
+        "threads": (1, 100),
+        "rate": (1, 100_000),
+        "batch_size": (1, 10_000),
+        "aggression": (1, 4),
+    }
+    for key, (low, high) in integer_limits.items():
+        if key not in cleaned:
+            continue
+        value = cleaned[key]
+        if isinstance(value, bool):
+            return None, f"{key} must be an integer"
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None, f"{key} must be an integer"
+        if not low <= value <= high:
+            return None, f"{key} must be between {low} and {high}"
+        cleaned[key] = value
+    if "aggression" in cleaned and cleaned["aggression"] not in {1, 3, 4}:
+        return None, "aggression must be 1, 3, or 4"
+
+    for key in ("use_builtin", "follow_redirects", "tech_detect", "js_crawl", "no_subs"):
+        if key in cleaned and not isinstance(cleaned[key], bool):
+            return None, f"{key} must be a boolean"
+
+    enum_values = {
+        "scan_type": {"quick", "service", "vuln", "full"},
+        "scope": {"strict", "subs", "fuzzy"},
+        "method": {"GET", "POST", "JSON", "XML"},
+    }
+    if "mode" in cleaned:
+        modes = {
+            "amass": {"passive", "active"},
+            "ffuf": {"dir", "vhost", "param"},
+            "gobuster": {"dir", "dns", "vhost"},
+        }.get(tool_name, set())
+        if cleaned["mode"] not in modes:
+            return None, f"Invalid mode for {tool_name}"
+    for key, allowed_values in enum_values.items():
+        if key in cleaned:
+            value = str(cleaned[key]).upper() if key == "method" else str(cleaned[key]).lower()
+            if value not in allowed_values:
+                return None, f"Invalid {key}"
+            cleaned[key] = value
+
+    for key in ("wordlist", "input_list"):
+        if key in cleaned and cleaned[key]:
+            path = _tool_local_path(cleaned[key])
+            if not path:
+                return None, f"{key} must be an existing file under the ATOMIC data or source directory"
+            cleaned[key] = path
+    if "templates" in cleaned and cleaned["templates"]:
+        path = _tool_local_path(cleaned["templates"], allow_directory=True)
+        if not path:
+            return None, "templates must be an existing local template file or directory"
+        cleaned["templates"] = path
+
+    if "paths" in cleaned:
+        paths = cleaned["paths"]
+        if not isinstance(paths, list) or len(paths) > 100:
+            return None, "paths must be a list of at most 100 URL paths"
+        normalized_paths = []
+        for value in paths:
+            if not isinstance(value, str) or not value.startswith("/") or len(value) > 256:
+                return None, "Each path must start with / and be at most 256 characters"
+            if any(ch in value for ch in ("\r", "\n", "\x00", ";", "|", "`", "$")):
+                return None, "Unsafe URL path"
+            normalized_paths.append(value)
+        cleaned["paths"] = normalized_paths
+
+    for key, value in cleaned.items():
+        if isinstance(value, str) and (len(value) > 2048 or any(ch in value for ch in ("\r", "\n", "\x00"))):
+            return None, f"Invalid {key}"
+    if "ports" in cleaned and not re.fullmatch(r"[0-9,-]{1,128}", str(cleaned["ports"])):
+        return None, "Invalid port specification"
+    if "record_types" in cleaned:
+        records = {part.strip().lower() for part in str(cleaned["record_types"]).split(",") if part.strip()}
+        if not records or not records <= {"a", "aaaa", "cname", "mx", "ns", "txt", "soa", "ptr"}:
+            return None, "Invalid DNS record types"
+        cleaned["record_types"] = ",".join(sorted(records))
+    return cleaned, ""
+
+
+def _filter_tool_params(tool_name: str, body: dict, family: str):
     """Return (params, error_response).  Rejects unknown kwargs (fail-closed)."""
-    allowed = _TOOL_PARAM_ALLOWLIST.get(tool_name, set())
+    table = _TOOL_PARAM_ALLOWLIST_EXTERNAL if family == "external" else _TOOL_PARAM_ALLOWLIST_RECON
+    allowed = table.get(tool_name, set())
     candidates = {k: v for k, v in body.items() if k not in ("target", "domain")}
     unknown = sorted(k for k in candidates if k not in allowed)
     if unknown:
@@ -2908,7 +3270,12 @@ def _filter_tool_params(tool_name: str, body: dict):
             ),
             400,
         )
-    return {k: candidates[k] for k in candidates if k in allowed}, None
+    params, validation_error = _normalize_tool_params(
+        tool_name, {k: candidates[k] for k in candidates if k in allowed}
+    )
+    if validation_error:
+        return None, (jsonify({"status": "error", "data": validation_error}), 400)
+    return params, None
 
 
 @app.route("/api/tools/external/<tool_name>/run", methods=["POST"])
@@ -2923,7 +3290,7 @@ def run_external_tool(tool_name):
     if not _tool_target_in_configured_scope(target):
         return jsonify({"status": "error", "data": "Target is outside the configured authorization scope"}), 403
     # SEC-003: reject unknown kwargs instead of forwarding them blindly.
-    params, err = _filter_tool_params(tool_name, body)
+    params, err = _filter_tool_params(tool_name, body, "external")
     if err:
         return err
     try:
@@ -2947,7 +3314,7 @@ def run_external_tool(tool_name):
 
 
 @app.route("/api/recon/arsenal", methods=["GET"])
-@_require_api_key
+@_require_permission("tools.use")
 @_rate_limit
 def list_recon_arsenal():
     """List all recon arsenal tools, their categories, and availability."""
@@ -2981,7 +3348,7 @@ def run_recon_tool(tool_name):
     if not _tool_target_in_configured_scope(target):
         return jsonify({"status": "error", "data": "Target is outside the configured authorization scope"}), 403
     # SEC-003: reject unknown kwargs instead of forwarding them blindly.
-    params, err = _filter_tool_params(tool_name, body)
+    params, err = _filter_tool_params(tool_name, body, "recon")
     if err:
         return err
     try:
@@ -3037,7 +3404,7 @@ def run_full_recon():
 
 
 @app.route("/api/plugins", methods=["GET"])
-@_require_api_key
+@_require_permission("plugin.manage")
 @_rate_limit
 def list_plugins():
     """List all registered plugins."""
@@ -3316,6 +3683,24 @@ def get_ai_correlations():
 # Default model is ``qwen2.5-coder:7b`` to match the AI Brain UI defaults.
 
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
+_OLLAMA_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+_OLLAMA_MAX_ERROR_BYTES = 64 * 1024
+_OLLAMA_MAX_MODEL_NAME = 128
+_OLLAMA_MAX_PULL_JOBS = 20
+_OLLAMA_MAX_ACTIVE_PULLS = 1
+
+
+def _bounded_env_int(name, default, minimum, maximum):
+    try:
+        return max(minimum, min(int(os.environ.get(name, str(default))), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
+_OLLAMA_PULL_MAX_SECONDS = _bounded_env_int("ATOMIC_OLLAMA_PULL_TIMEOUT", 3600, 300, 7200)
+_OLLAMA_MAX_MODEL_BYTES = _bounded_env_int(
+    "ATOMIC_OLLAMA_MAX_MODEL_BYTES", 25 * 1024**3, 1024**3, 100 * 1024**3
+)
 
 # Background process handle for an Ollama daemon we started ourselves.
 # Kept so we can keep it alive for the lifetime of the Flask process.
@@ -3323,14 +3708,27 @@ _ollama_serve_proc = None
 _ollama_serve_lock = threading.Lock()
 
 
+def _ollama_binary():
+    """Return a trusted Ollama executable path, never an unsafe PATH entry."""
+    try:
+        from core.tool_runtime import resolve_tool
+        return resolve_tool("ollama")
+    except Exception:
+        return None
+
+
 def _ollama_available():
     """Check if ollama binary is available on the system."""
     try:
+        binary = _ollama_binary()
+        if not binary:
+            return False
         result = subprocess.run(
-            ["ollama", "--version"],
-            capture_output=True,
-            text=True,
+            [binary, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=5,
+            check=False,
         )
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -3370,8 +3768,11 @@ def _ollama_request_ex(path, method="GET", json_data=None, timeout=120):
         headers={"Content-Type": "application/json"} if req_data else {},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(req, timeout=max(1, min(int(timeout), 300))) as resp:
+            raw_body = resp.read(_OLLAMA_MAX_RESPONSE_BYTES + 1)
+            if len(raw_body) > _OLLAMA_MAX_RESPONSE_BYTES:
+                return False, None, "Ollama response exceeded the 10 MiB safety limit"
+            body = raw_body.decode("utf-8", errors="replace")
             try:
                 return True, json.loads(body), ""
             except json.JSONDecodeError:
@@ -3380,7 +3781,9 @@ def _ollama_request_ex(path, method="GET", json_data=None, timeout=120):
                 return True, body, ""
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read().decode("utf-8", errors="replace")
+            body = exc.read(_OLLAMA_MAX_ERROR_BYTES + 1)[:_OLLAMA_MAX_ERROR_BYTES].decode(
+                "utf-8", errors="replace"
+            )
         except Exception:
             body = ""
         return False, None, f"HTTP {exc.code}: {body or exc.reason}"
@@ -3450,8 +3853,11 @@ def _ollama_serve_start(wait_seconds=15):
             try:
                 # ``start_new_session=True`` detaches from the parent so
                 # the daemon keeps running if the request thread dies.
+                binary = _ollama_binary()
+                if not binary:
+                    return False, "Ollama executable is unavailable or has unsafe permissions"
                 _ollama_serve_proc = subprocess.Popen(
-                    ["ollama", "serve"],
+                    [binary, "serve"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
@@ -3474,7 +3880,7 @@ def _ollama_serve_start(wait_seconds=15):
 
 
 @app.route("/api/ollama/status", methods=["GET"])
-@_require_api_key
+@_require_permission("tools.use")
 @_rate_limit
 def ollama_status():
     """Check Ollama installation and running status."""
@@ -3557,8 +3963,8 @@ def ollama_start():
 #
 # We now run the pull as a background thread, ask Ollama for an NDJSON
 # progress stream, and parse each line into a job-state dict the
-# frontend can poll.  No timeout on the pull itself; the thread exits
-# cleanly on success / failure / process shutdown.
+# frontend can poll.  Pulls have bounded inactivity, total-time, line-size,
+# concurrency and model-size limits.
 
 _ollama_pull_jobs: dict = {}
 _ollama_pull_lock = threading.Lock()
@@ -3566,6 +3972,15 @@ _OLLAMA_PULL_JOB_TTL = 60 * 60  # purge completed jobs after 1 hour
 
 # Validates a model name like ``qwen2.5-coder:7b`` or ``library/llama3:latest``.
 _OLLAMA_MODEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$")
+
+
+def _valid_ollama_model_name(value):
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= _OLLAMA_MAX_MODEL_NAME
+        and _OLLAMA_MODEL_RE.fullmatch(value) is not None
+        and ".." not in value
+    )
 
 
 def _purge_old_pull_jobs():
@@ -3601,13 +4016,20 @@ def _ollama_pull_run(job_id, model_name):
             job.update(kw)
 
     try:
-        # No socket timeout — Ollama may take a long time on large
-        # models, and we read the stream incrementally so a slow line
-        # doesn't kill the whole pull.
-        with urllib.request.urlopen(req, timeout=None) as resp:
-            for raw in resp:
+        deadline = time.monotonic() + _OLLAMA_PULL_MAX_SECONDS
+        # A progress event should arrive regularly.  Bound both socket
+        # inactivity and total job lifetime; also cap each NDJSON event.
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            while True:
+                if time.monotonic() >= deadline:
+                    _set(done=True, ok=False, error="Model pull exceeded the time limit", ended_at=time.time())
+                    return
+                raw = resp.readline(64 * 1024 + 1)
                 if not raw:
-                    continue
+                    break
+                if len(raw) > 64 * 1024:
+                    _set(done=True, ok=False, error="Ollama progress event was too large", ended_at=time.time())
+                    return
                 try:
                     evt = json.loads(raw.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
@@ -3626,6 +4048,14 @@ def _ollama_pull_run(job_id, model_name):
                 status_text = evt.get("status", "")
                 completed = int(evt.get("completed", 0) or 0)
                 total = int(evt.get("total", 0) or 0)
+                if total < 0 or completed < 0 or total > _OLLAMA_MAX_MODEL_BYTES:
+                    _set(
+                        done=True,
+                        ok=False,
+                        error="Requested model exceeds the configured download limit",
+                        ended_at=time.time(),
+                    )
+                    return
                 percent = (100.0 * completed / total) if total > 0 else None
                 _set(
                     status_text=status_text,
@@ -3655,7 +4085,9 @@ def _ollama_pull_run(job_id, model_name):
         )
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read().decode("utf-8", errors="replace")
+            body = exc.read(_OLLAMA_MAX_ERROR_BYTES + 1)[:_OLLAMA_MAX_ERROR_BYTES].decode(
+                "utf-8", errors="replace"
+            )
         except Exception:
             body = ""
         _set(
@@ -3686,6 +4118,8 @@ def _ollama_start_pull(model_name):
     Auto-starts ``ollama serve`` if the daemon is installed but not
     running so the user does not need to pre-start anything.
     """
+    if not _valid_ollama_model_name(model_name):
+        return None, "Invalid model name"
     running, err = _ollama_serve_start(wait_seconds=15)
     if not running:
         return None, err
@@ -3706,6 +4140,14 @@ def _ollama_start_pull(model_name):
         "error": "",
     }
     with _ollama_pull_lock:
+        for existing_id, existing in _ollama_pull_jobs.items():
+            if existing.get("model") == model_name and not existing.get("done"):
+                return existing_id, ""
+        active = sum(1 for item in _ollama_pull_jobs.values() if not item.get("done"))
+        if active >= _OLLAMA_MAX_ACTIVE_PULLS:
+            return None, "Another model pull is already running"
+        if len(_ollama_pull_jobs) >= _OLLAMA_MAX_PULL_JOBS:
+            return None, "Model pull job capacity reached; try again after completed jobs expire"
         _ollama_pull_jobs[job_id] = job
 
     threading.Thread(
@@ -3770,7 +4212,7 @@ def ollama_pull_model():
     """
     body = request.get_json(silent=True)
     model_name = body.get("model", "") if body else ""
-    if not model_name or not _OLLAMA_MODEL_RE.match(model_name) or ".." in model_name:
+    if not _valid_ollama_model_name(model_name):
         return jsonify({"status": "error", "data": "Invalid model name"}), 400
 
     if not _ollama_available():
@@ -3801,11 +4243,11 @@ def ollama_pull_model():
 
 
 @app.route("/api/ollama/pull/<job_id>", methods=["GET"])
-@_require_api_key
+@_require_permission("tools.use")
 @_rate_limit
 def ollama_pull_status(job_id):
     """Return the live progress of a background pull job."""
-    if not re.match(r"^[a-fA-F0-9]{4,32}$", job_id or ""):
+    if not re.fullmatch(r"[a-fA-F0-9]{16}", job_id or ""):
         return jsonify({"status": "error", "data": "Invalid job id"}), 400
     with _ollama_pull_lock:
         job = _ollama_pull_jobs.get(job_id)
@@ -3834,7 +4276,7 @@ def ollama_auto_setup():
     """
     body = request.get_json(silent=True) or {}
     model_name = (body.get("model") or DEFAULT_OLLAMA_MODEL).strip()
-    if not _OLLAMA_MODEL_RE.match(model_name) or ".." in model_name:
+    if not _valid_ollama_model_name(model_name):
         return jsonify({"status": "error", "data": "Invalid model name"}), 400
 
     if not _ollama_available():
@@ -3903,7 +4345,9 @@ def ollama_chat():
     if not body or not isinstance(body.get("message"), str) or not body["message"].strip():
         return jsonify({"status": "error", "data": "Missing or empty message"}), 400
 
-    model = body.get("model", "qwen2.5-coder:7b")
+    model = body.get("model", DEFAULT_OLLAMA_MODEL)
+    if not _valid_ollama_model_name(model):
+        return jsonify({"status": "error", "data": "Invalid model name"}), 400
     user_msg = body["message"].strip()[:4000]
     system_prompt = body.get(
         "system_prompt",
@@ -3912,6 +4356,9 @@ def ollama_chat():
         "vulnerabilities, interpret scan results, suggest remediation, "
         "and explain security concepts. Be concise and technical.",
     )
+    if not isinstance(system_prompt, str):
+        return jsonify({"status": "error", "data": "Invalid system prompt"}), 400
+    system_prompt = system_prompt[:4000]
 
     # Build conversation messages
     with _ollama_lock:
@@ -3955,7 +4402,7 @@ def ollama_chat():
 
 
 @app.route("/api/ollama/chat/history", methods=["GET"])
-@_require_api_key
+@_require_permission("tools.use")
 @_rate_limit
 def ollama_chat_history():
     """Return Ollama chat history."""
@@ -3964,7 +4411,7 @@ def ollama_chat_history():
 
 
 @app.route("/api/ollama/chat/history", methods=["DELETE"])
-@_require_api_key
+@_require_permission("chat.manage")
 @_rate_limit
 def ollama_clear_history():
     """Clear Ollama chat history."""
@@ -4009,6 +4456,13 @@ if SOCKETIO_AVAILABLE and socketio is not None:
     def handle_connect(auth=None):
         """Authenticate the WebSocket before exposing scan data or controls."""
         user = _get_current_user()
+        if user is None and isinstance(auth, dict) and _user_store is not None:
+            token = str(auth.get("token") or "").strip()
+            if token:
+                try:
+                    user = _user_store.validate_request_token(token)
+                except Exception:
+                    user = None
         if user is None:
             return False
         with _ws_users_lock:
@@ -4035,7 +4489,10 @@ if SOCKETIO_AVAILABLE and socketio is not None:
     def handle_subscribe(data):
         with _ws_users_lock:
             user = _ws_users.get(request.sid)
-        if user is None or "scan.read" not in PERMISSIONS.get(user.get("role", ""), set()):
+        if user is None or (
+            user.get("role") != "admin"
+            and "scan.read" not in PERMISSIONS.get(user.get("role", ""), set())
+        ):
             emit("error", {"message": "Unauthorized"})
             return
         """Client wants live events for a specific scan."""
@@ -4056,7 +4513,10 @@ if SOCKETIO_AVAILABLE and socketio is not None:
         """Execute a shell command via WebSocket after RBAC enforcement."""
         with _ws_users_lock:
             user = _ws_users.get(request.sid)
-        if user is None or "shell.execute" not in PERMISSIONS.get(user.get("role", ""), set()):
+        if user is None or (
+            user.get("role") != "admin"
+            and "shell.execute" not in PERMISSIONS.get(user.get("role", ""), set())
+        ):
             emit("shell_output", {"error": "Unauthorized"})
             return
         if _ws_rate_limited():
@@ -4098,7 +4558,10 @@ if SOCKETIO_AVAILABLE and socketio is not None:
         """Receive an authenticated chat message and broadcast it."""
         with _ws_users_lock:
             user = _ws_users.get(request.sid)
-        if user is None or "chat.write" not in PERMISSIONS.get(user.get("role", ""), set()):
+        if user is None or (
+            user.get("role") != "admin"
+            and "chat.write" not in PERMISSIONS.get(user.get("role", ""), set())
+        ):
             emit("error", {"message": "Unauthorized"})
             return
         if _ws_rate_limited() or not isinstance(data, dict):
@@ -4554,12 +5017,18 @@ def get_nuclei_template(template_path):
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "nuclei_templates",
     )
-    # Prevent directory traversal
+    # Prevent directory traversal using canonical paths rather than string
+    # prefix checks (``/safe/templates2`` must not count as inside
+    # ``/safe/templates``).  Reject absolute paths on both POSIX and Windows.
     safe_path = os.path.normpath(template_path)
-    if ".." in safe_path or safe_path.startswith("/"):
+    if os.path.isabs(safe_path) or safe_path == ".." or safe_path.startswith(".." + os.sep):
         return jsonify({"status": "error", "data": "Invalid path"}), 400
-    full_path = os.path.join(templates_dir, safe_path)
-    if not full_path.startswith(templates_dir):
+    templates_dir = os.path.realpath(templates_dir)
+    full_path = os.path.realpath(os.path.join(templates_dir, safe_path))
+    try:
+        if os.path.commonpath([templates_dir, full_path]) != templates_dir:
+            return jsonify({"status": "error", "data": "Invalid path"}), 400
+    except ValueError:
         return jsonify({"status": "error", "data": "Invalid path"}), 400
     if not os.path.isfile(full_path):
         return jsonify({"status": "error", "data": "Template not found"}), 404
@@ -4878,7 +5347,7 @@ def search_all_findings():
 
 
 @app.route("/api/scan/<scan_id>/export", methods=["GET"])
-@_require_api_key
+@_require_permission("findings.export")
 @_rate_limit
 def export_scan_findings(scan_id):
     """Export scan findings as CSV or JSON."""
@@ -4947,13 +5416,14 @@ def export_scan_findings(scan_id):
     else:
         import csv
         import io
+        from utils.helpers import spreadsheet_safe
 
         out = io.StringIO()
         fieldnames = ["technique", "severity", "url", "param", "payload", "evidence", "cvss", "mitre_id", "cwe_id"]
         writer = csv.DictWriter(out, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for f in findings:
-            writer.writerow({k: f.get(k, "") for k in fieldnames})
+            writer.writerow({k: spreadsheet_safe(f.get(k, "")) for k in fieldnames})
         return Response(
             out.getvalue(),
             mimetype="text/csv",
@@ -4972,7 +5442,11 @@ def create_app(host="127.0.0.1", port=5000, debug=False):
     app.config["PORT"] = port
     app.config["DEBUG"] = debug
 
-    os.makedirs(Config.REPORTS_DIR, exist_ok=True)
+    os.makedirs(Config.REPORTS_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(Config.REPORTS_DIR, 0o700)
+    except OSError:
+        pass
 
     # Wire the scheduler to trigger scans via _run_scan
     if _scheduler is not None:

@@ -28,11 +28,11 @@ export function mount(root) {
   const targetBatch = h("textarea", { class: "input", rows: "6", placeholder: "One URL per line…", style: { display: "none" } });
 
   const modBoxes = MODULES.map(([key, label]) =>
-    h("label", { class: "check" }, h("input", { type: "checkbox", value: key }), label));
+    h("label", { class: "check" }, h("input", { type: "checkbox", value: key, checked: true }), label));
 
-  const fullScan = h("input", { type: "checkbox" });
-  const autoExploit = h("input", { type: "checkbox" });
-  const recon = h("input", { type: "checkbox" });
+  const fullScan = h("input", { type: "checkbox", checked: true });
+  const autoExploit = h("input", { type: "checkbox", checked: true });
+  const recon = h("input", { type: "checkbox", checked: true });
   const evasion = h("select", { class: "input" },
     ...["none", "low", "medium", "high"].map((v) => h("option", { value: v }, v)));
   const depth = h("input", { type: "number", class: "input", value: "2", min: "1", max: "10" });
@@ -59,8 +59,8 @@ export function mount(root) {
     h("h4", {}, "Modules"),
     h("div", { class: "mod-grid" }, ...modBoxes),
     h("div", { class: "opt-grid" },
-      h("label", { class: "check" }, fullScan, "Full scan (all modules)"),
-      h("label", { class: "check" }, autoExploit, "Auto-exploit"),
+      h("label", { class: "check" }, fullScan, "Owner full scan (all available modules)"),
+      h("label", { class: "check" }, autoExploit, "Authorized auto-exploit"),
       h("label", { class: "check" }, recon, "Recon")),
     h("div", { class: "field-grid" },
       h("label", {}, "Evasion", evasion),

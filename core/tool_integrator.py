@@ -18,8 +18,11 @@ Each tool adapter follows a common interface:
 
 import json
 import os
+import selectors
+import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -84,46 +87,97 @@ def _is_safe_target_arg(arg: str) -> bool:
 
 
 def _sanitize_tool_cmd(cmd: list) -> tuple[bool, str]:
-    """Validate that no positional argument in *cmd* is an option injection.
+    """Validate an external-tool argv against the framework's known flags.
 
-    The first element is executable name, subsequent elements are flags or targets.
-    We allow known flags (starting with '-') only if they are from an allowlist
-    of expected flags per tool. For generic validation, we reject any arg after
-    a target flag that starts with '-'.
-    Returns (ok, error_message).
+    ``subprocess.run(..., shell=False)`` prevents shell expansion, but it does
+    not prevent option injection.  Keep the accepted CLI surface explicit so
+    a target string cannot silently become a new scanner option.
     """
-    # Expected flag prefixes for our toolset
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        return False, "invalid command"
+
     known_flags = {
-        "-d", "-u", "-t", "-h", "-F", "-T4", "-sV", "-sC", "-p", "-oX",
+        "--", "-d", "-u", "-t", "-h", "-F", "-T4", "-sV", "-sC", "-p", "-oX",
         "-Pn", "--script", "-O", "-p-", "-jsonl", "-silent", "-severity",
         "-tags", "-Format", "-o", "-Tuning", "--log-json=-", "-log-json",
         "-a", "-follow-redirects", "-path", "-status-code", "-content-length",
-        "-title", "-tech-detect", "-server", "-json", "-w", "-e", "-fc",
-        "-of", "-s", "--subs", "-o", "-of", "-w", "-e", "-fc", "-s", "--log-json"
+        "-title", "-tech-detect", "-server", "-web-server", "-json", "-w", "-e", "-fc",
+        "-of", "-s", "--subs", "--providers", "--blacklist", "--log-json",
+        "-passive", "-active", "-l", "-headless", "-resp", "-aaaa", "-cname",
+        "-mx", "-ns", "-txt", "-soa", "-ptr", "-H", "-no-subs", "-q",
+        "--no-color", "-x", "--silent", "--json", "--no-state", "-C", "--rate",
+        "-oJ", "-b", "--greppable", "-url", "-depth", "-scope", "-plain", "-m",
+        "--exclude", "--format",
     }
-    # We only inspect args that look like domains/urls (positional)
-    # For simplicity, reject any arg that is exactly a flag injection attempting
-    # to masquerade as target but is actually starting with '-'.
-    for i, arg in enumerate(cmd[1:], start=1):
-        # If arg is known flag, ok
-        if arg in known_flags or arg.startswith("-a"):
-            continue
-        # If arg contains '=', it's likely a flag with value, allow
-        if "=" in arg and arg.startswith("-"):
-            continue
-        # If arg starts with '-', it's suspicious as positional
-        if isinstance(arg, str) and arg.startswith("-") and len(arg) > 1:
-            # Check if previous arg was a flag that expects a value, then this is value
-            prev = cmd[i-1] if i-1 >= 0 else ""
-            if prev in ("-d", "-u", "-t", "-h", "-p", "-oX", "-Format", "-o", "-Tuning", "-path", "-w", "-e", "-fc", "-t"):
-                # This arg is supposed to be a value (e.g., domain). Reject if looks like flag.
+    value_flags = {
+        "-d", "-u", "-t", "-h", "-p", "-oX", "--script", "-severity",
+        "-tags", "-Format", "-o", "-Tuning", "-path", "-server",
+        "-w", "-e", "-fc", "-of", "-l", "--providers", "--blacklist",
+        "-H", "-x", "-C", "--rate", "-oJ", "-b", "-url", "-depth", "-scope",
+        "-m", "--exclude", "--format",
+    }
+
+    expect_value_for = None
+    for arg in cmd[1:]:
+        if expect_value_for is not None:
+            if arg == "-" and expect_value_for in {"-w", "-o"}:
+                expect_value_for = None
+                continue
+            if arg.startswith("-"):
                 return False, f"Invalid target argument (flag injection): {arg!r}"
+            if not _is_safe_target_arg(arg):
+                return False, f"Invalid argument value for {expect_value_for}: {arg!r}"
+            expect_value_for = None
+            continue
+
+        if arg.startswith("-"):
+            if arg in known_flags or arg.startswith("-a="):
+                # ``-a`` means an A-record switch in dnsx, but a value option
+                # in WhatWeb and RustScan.  Resolve the ambiguity by adapter.
+                if arg in value_flags or (arg == "-a" and cmd[0] in {"whatweb", "rustscan"}):
+                    expect_value_for = arg
+                continue
+            if "=" in arg:
+                flag, value = arg.split("=", 1)
+                if flag in known_flags and value and _is_safe_target_arg(value):
+                    continue
+            return False, f"Unsupported external-tool option: {arg!r}"
+
+        if not _is_safe_target_arg(arg):
+            return False, f"Unsafe external-tool argument: {arg!r}"
+
+    if expect_value_for is not None:
+        return False, f"Missing value for external-tool option: {expect_value_for}"
     return True, ""
 
 
-def _run_command(cmd: list, timeout: int = 300, cwd: str = None, max_output_bytes: int = 5 * 1024 * 1024) -> tuple:
-    """Run a tool with bounded output and managed executable resolution."""
-    import time
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Best-effort termination of a scanner and descendants in its process group."""
+    if proc.poll() is not None and os.name != "posix":
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:  # pragma: no cover - Windows fallback
+            proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:  # pragma: no cover - Windows fallback
+                proc.kill()
+        except Exception:
+            pass
+
+
+def _run_command(cmd: list, timeout: int = 300, cwd: str = None, max_output_bytes: int = 2 * 1024 * 1024) -> tuple:
+    """Run a tool with bounded in-memory output and a hard process timeout.
+
+    Pipes are drained incrementally so a noisy scanner cannot allocate an
+    unbounded ``capture_output`` buffer or deadlock on a full pipe.  Once the
+    cap is reached data is discarded while the pipe continues to be drained.
+    """
     if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
         return -3, "", "invalid command", 0.0
     # SECURITY FIX (TOOL-001): Validate against argument injection
@@ -144,31 +198,74 @@ def _run_command(cmd: list, timeout: int = 300, cwd: str = None, max_output_byte
     if not executable:
         return -2, "", f"Command not found: {cmd[0]}", 0.0
     cmd = [executable, *cmd[1:]]
-    start = time.time()
+    timeout = max(1, min(int(timeout), 1800))
+    max_output_bytes = max(1024, min(int(max_output_bytes), 16 * 1024 * 1024))
+    start = time.monotonic()
+    proc = None
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=max(1, int(timeout)), cwd=cwd,
-            check=False, env={k: v for k, v in os.environ.items() if k not in {"LD_PRELOAD", "PYTHONINSPECT", "PYTHONPATH"}},
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            cwd=cwd,
+            env={k: v for k, v in os.environ.items() if k not in {"LD_PRELOAD", "PYTHONINSPECT", "PYTHONPATH"}},
+            start_new_session=(os.name == "posix"),
         )
-        duration = time.time() - start
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
         truncated = False
-        if len(stdout.encode("utf-8", "ignore")) > max_output_bytes:
-            stdout = stdout.encode("utf-8", "ignore")[:max_output_bytes].decode("utf-8", "ignore")
-            truncated = True
-        if len(stderr.encode("utf-8", "ignore")) > max_output_bytes:
-            stderr = stderr.encode("utf-8", "ignore")[:max_output_bytes].decode("utf-8", "ignore")
-            truncated = True
+        deadline = start + timeout
+        timed_out = False
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _terminate_process_tree(proc)
+                break
+            events = selector.select(min(0.25, remaining))
+            for key, _mask in events:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buf = buffers[key.data]
+                room = max_output_bytes - len(buf)
+                if room > 0:
+                    buf.extend(chunk[:room])
+                if len(chunk) > room:
+                    truncated = True
+            if proc.poll() is not None and not events:
+                # A normal child closes its pipes immediately.  If a spawned
+                # grandchild inherited them, do not wait past the deadline.
+                continue
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if proc.poll() is None:
+            _terminate_process_tree(proc)
+        return_code = proc.wait(timeout=2) if proc.poll() is None else proc.returncode
+        duration = time.monotonic() - start
+        stdout = bytes(buffers["stdout"]).decode("utf-8", "replace")
+        stderr = bytes(buffers["stderr"]).decode("utf-8", "replace")
         if truncated:
-            stderr += "\n[output truncated by framework]"
-        return result.returncode, stdout, stderr, duration
-    except subprocess.TimeoutExpired:
-        return -1, "", f"Command timed out after {timeout}s", time.time() - start
+            stderr += "\n[output truncated at the configured safety limit]"
+        if timed_out:
+            return -1, stdout, (stderr + f"\nCommand timed out after {timeout}s").strip(), duration
+        return return_code, stdout, stderr, duration
     except FileNotFoundError:
         return -2, "", f"Command not found: {cmd[0]}", 0.0
     except (OSError, subprocess.SubprocessError) as exc:
-        return -3, "", str(exc), time.time() - start
+        if proc is not None:
+            _terminate_process_tree(proc)
+        return -3, "", str(exc), time.monotonic() - start
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +634,13 @@ class WhatWebAdapter:
         if not self.is_available():
             return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="whatweb not installed")
 
-        cmd = ["whatweb", "--log-json=-", f"-a{aggression}", target]
+        try:
+            aggression = int(aggression)
+        except (TypeError, ValueError):
+            aggression = 1
+        if aggression not in {1, 3, 4}:
+            return ToolResult(tool=self.TOOL_NAME, target=target, success=False, error="Invalid aggression level")
+        cmd = ["whatweb", "--log-json=-", "-a", str(aggression), target]
 
         exit_code, stdout, stderr, duration = _run_command(cmd, timeout=timeout)
 

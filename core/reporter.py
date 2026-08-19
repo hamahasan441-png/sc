@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 
 from config import Config, Colors
+from utils.helpers import spreadsheet_safe
 
 
 class ReportGenerator:
@@ -44,7 +45,11 @@ class ReportGenerator:
         self.end_time = end_time
         self.total_requests = total_requests
         self.output_dir = output_dir or Config.REPORTS_DIR
-        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.output_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(self.output_dir, 0o700)
+        except OSError:
+            pass
 
         # Phase 10 enrichment data
         self.exploit_chains = exploit_chains or []
@@ -118,6 +123,10 @@ class ReportGenerator:
         if generator:
             filepath = generator()
             if filepath:
+                try:
+                    os.chmod(filepath, 0o600)
+                except OSError:
+                    pass
                 print(f"{Colors.success(f'Report generated: {filepath}')}")
             return filepath
         else:
@@ -587,7 +596,7 @@ class ReportGenerator:
                 for finding in findings_data:
                     signals_str = self._format_signals(finding.get("signals", {}))
                     writer.writerow(
-                        [
+                        [spreadsheet_safe(value) for value in [
                             finding.get("severity", ""),
                             finding.get("technique", ""),
                             finding.get("url", ""),
@@ -601,7 +610,7 @@ class ReportGenerator:
                             signals_str,
                             finding.get("priority", ""),
                             finding.get("remediation", ""),
-                        ]
+                        ]]
                     )
         except (IOError, OSError) as e:
             print(f"{Colors.error(f'Cannot write report to {filepath}: {e}')}")

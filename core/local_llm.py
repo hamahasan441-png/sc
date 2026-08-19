@@ -20,9 +20,11 @@ Usage:
 import os
 import sys
 import json
+import hashlib
 import platform
-import shutil
+import re
 import time
+from urllib.parse import urlparse
 
 
 from config import Config, Colors
@@ -35,9 +37,11 @@ DEFAULT_MODEL_REPO = "Qwen/Qwen2.5-7B-Instruct-GGUF"
 DEFAULT_MODEL_FILE = "qwen2.5-7b-instruct-q4_k_m.gguf"
 DEFAULT_MODEL_URL = f"https://huggingface.co/{DEFAULT_MODEL_REPO}" f"/resolve/main/{DEFAULT_MODEL_FILE}"
 DEFAULT_MODEL_SIZE_BYTES = 4_700_000_000  # ~4.7 GB
+DEFAULT_MODEL_SHA256 = os.environ.get("ATOMIC_MODEL_SHA256", "").strip().lower()
+MAX_MODEL_SIZE_BYTES = 25 * 1024**3
 
 # Directory to store downloaded models
-MODELS_DIR = os.path.join(Config.BASE_DIR, "models")
+MODELS_DIR = os.path.join(Config.ATOMIC_HOME, "models")
 
 # Inference defaults (tuned for security analysis on low-resource devices)
 DEFAULT_CTX_SIZE = 2048
@@ -71,16 +75,27 @@ def _download_progress(current, total, bar_length=40):
 def get_model_path(model_file=None):
     """Return the local path for the GGUF model file."""
     fname = model_file or DEFAULT_MODEL_FILE
+    if not isinstance(fname, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.gguf", fname):
+        raise ValueError("Model filename must be a simple .gguf basename")
     return os.path.join(MODELS_DIR, fname)
 
 
 def is_model_downloaded(model_file=None):
     """Check whether the GGUF model exists locally."""
-    path = get_model_path(model_file)
-    return os.path.isfile(path) and os.path.getsize(path) > 100_000_000
+    try:
+        path = get_model_path(model_file)
+        if os.path.islink(path) or not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if not 100_000_000 < size <= MAX_MODEL_SIZE_BYTES:
+            return False
+        with open(path, "rb") as handle:
+            return handle.read(4) == b"GGUF"
+    except (OSError, ValueError):
+        return False
 
 
-def download_model(model_url=None, model_file=None, force=False):
+def download_model(model_url=None, model_file=None, force=False, expected_sha256=None):
     """Download the Qwen2.5-7B GGUF model from HuggingFace.
 
     Uses ``requests`` (already a framework dependency) for the download
@@ -103,12 +118,32 @@ def download_model(model_url=None, model_file=None, force=False):
     """
     url = model_url or DEFAULT_MODEL_URL
     dest = get_model_path(model_file)
+    expected = (expected_sha256 or DEFAULT_MODEL_SHA256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        print(
+            f"{Colors.error('Refusing an unverified model download. Set ATOMIC_MODEL_SHA256 to the publisher-verified SHA-256.')}"
+        )
+        return ""
+    parsed = urlparse(url)
+    custom_allowed = os.environ.get("ATOMIC_ALLOW_CUSTOM_MODEL_URL", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if parsed.scheme != "https" or not parsed.hostname:
+        print(f"{Colors.error('Model downloads require an HTTPS URL.')}")
+        return ""
+    if model_url and parsed.hostname != "huggingface.co" and not custom_allowed:
+        print(f"{Colors.error('Custom model hosts require ATOMIC_ALLOW_CUSTOM_MODEL_URL=1.')}")
+        return ""
 
     if not force and is_model_downloaded(model_file):
         print(f"{Colors.success(f'Model already downloaded: {dest}')}")
         return dest
 
-    os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(MODELS_DIR, 0o700)
+    except OSError:
+        pass
 
     print(f"{Colors.info('Downloading Qwen2.5-7B-Instruct GGUF model...')}")
     print(f"  Source : {url}")
@@ -129,7 +164,7 @@ def download_model(model_url=None, model_file=None, force=False):
         print(f"{Colors.info(f'Resuming from {resume_size / (1024**2):.0f} MB...')}")
 
     try:
-        resp = requests.get(url, stream=True, headers=headers, timeout=60)
+        resp = requests.get(url, stream=True, headers=headers, timeout=(15, 120))
         resp.raise_for_status()
     except requests.RequestException as exc:
         print(f"{Colors.error(f'Download failed: {exc}')}")
@@ -137,7 +172,28 @@ def download_model(model_url=None, model_file=None, force=False):
         print(f"  wget {url} -O {dest}")
         return ""
 
-    total = int(resp.headers.get("content-length", 0)) + resume_size
+    if resume_size:
+        content_range = resp.headers.get("content-range", "")
+        if resp.status_code != 206 or not content_range.startswith(f"bytes {resume_size}-"):
+            resp.close()
+            print(f"{Colors.warning('Server did not honor the resume range; restarting safely.')}")
+            resume_size = 0
+            try:
+                resp = requests.get(url, stream=True, timeout=(15, 120))
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                print(f"{Colors.error(f'Download restart failed: {exc}')}")
+                return ""
+
+    try:
+        content_length = int(resp.headers.get("content-length", 0) or 0)
+    except (TypeError, ValueError):
+        content_length = 0
+    total = content_length + resume_size
+    if total and total > MAX_MODEL_SIZE_BYTES:
+        resp.close()
+        print(f"{Colors.error('Model exceeds the 25 GiB safety limit.')}")
+        return ""
 
     mode = "ab" if resume_size else "wb"
     try:
@@ -147,6 +203,8 @@ def download_model(model_url=None, model_file=None, force=False):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
+                    if downloaded > MAX_MODEL_SIZE_BYTES:
+                        raise ValueError("Model exceeded the 25 GiB safety limit")
                     _download_progress(downloaded, total)
     # NOTE: KeyboardInterrupt inherits from BaseException, NOT Exception,
     # so the tuple form here is required (not redundant). Catching Ctrl-C
@@ -157,10 +215,35 @@ def download_model(model_url=None, model_file=None, force=False):
         print(f"{Colors.info('Partial file saved — re-run to resume.')}")
         return ""
 
-    # Rename from .part to final name
-    shutil.move(tmp_path, dest)
+    digest = hashlib.sha256()
+    try:
+        with open(tmp_path, "rb") as handle:
+            if handle.read(4) != b"GGUF":
+                raise ValueError("Downloaded file is not a GGUF model")
+            handle.seek(0)
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if not secrets_compare(digest.hexdigest(), expected):
+            raise ValueError("Model SHA-256 does not match the trusted digest")
+    except (OSError, ValueError) as exc:
+        print(f"{Colors.error(f'Model verification failed: {exc}')}")
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return ""
+
+    # Atomic promotion from .part to the private model directory.
+    os.replace(tmp_path, dest)
+    os.chmod(dest, 0o600)
     print(f"\n{Colors.success(f'Model downloaded successfully: {dest}')}")
     return dest
+
+
+def secrets_compare(left, right):
+    """Small local wrapper to avoid timing-dependent checksum comparisons."""
+    import hmac
+    return hmac.compare_digest(left, right)
 
 
 # ── LLM Inference Engine ──────────────────────────────────────────────
@@ -201,7 +284,10 @@ class LocalLLM:
 
         On Termux this compiles from source using clang.
         """
-        print(f"{Colors.info('Installing llama-cpp-python (this may take a few minutes on Termux)...')}")
+        if os.environ.get("ATOMIC_ALLOW_PIP_INSTALL", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            print(f"{Colors.warning('Automatic pip installation is disabled; install the pinned optional dependency explicitly.')}")
+            return False
+        print(f"{Colors.info('Installing the pinned llama-cpp-python backend...')}")
         import subprocess
 
         env = os.environ.copy()
@@ -212,14 +298,14 @@ class LocalLLM:
             env.setdefault("CXX", "clang++")
         try:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"],
+                [sys.executable, "-m", "pip", "install", "llama-cpp-python==0.3.16", "--no-cache-dir"],
                 env=env,
             )
             print(f"{Colors.success('llama-cpp-python installed successfully.')}")
             return True
         except subprocess.CalledProcessError as exc:
             print(f"{Colors.error(f'Installation failed: {exc}')}")
-            print(f"{Colors.info('Manual install:  pip install llama-cpp-python')}")
+            print(f"{Colors.info('Manual install:  pip install llama-cpp-python==0.3.16')}")
             return False
 
     def ensure_ready(self):
@@ -227,12 +313,10 @@ class LocalLLM:
 
         Returns True when inference is possible, False otherwise.
         """
-        # 1. Check / install backend
+        # 1. Check backend. Runtime scans never mutate their Python env.
         if not self.is_available():
-            print(f"{Colors.warning('llama-cpp-python not installed.')}")
-            ok = self.install_backend()
-            if not ok:
-                return False
+            print(f"{Colors.warning('llama-cpp-python is not installed; use the pinned full setup first.')}")
+            return False
 
         # 2. Check / download model
         if not os.path.isfile(self.model_path):
@@ -686,10 +770,15 @@ def main():
 
     if args.status:
         print(f"Backend (llama-cpp-python): {'✓ installed' if LocalLLM.is_available() else '✗ not installed'}")
-        path = get_model_path(args.model)
+        path = os.path.abspath(args.model) if args.model else get_model_path()
         print(f"Model path: {path}")
-        print(f"Model downloaded: {'✓ yes' if is_model_downloaded(args.model) else '✗ no'}")
-        if is_model_downloaded(args.model):
+        downloaded = (
+            os.path.isfile(path)
+            and not os.path.islink(path)
+            and 100_000_000 < os.path.getsize(path) <= MAX_MODEL_SIZE_BYTES
+        )
+        print(f"Model downloaded: {'✓ yes' if downloaded else '✗ no'}")
+        if downloaded:
             size_gb = os.path.getsize(path) / (1024**3)
             print(f"Model size: {size_gb:.2f} GB")
         print(f"Platform: {platform.system()} {platform.machine()}")

@@ -17,6 +17,8 @@ const CSRF_COOKIE = "csrf_token";
 const CSRF_HEADER = "X-CSRF-Token";
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const API_KEY_STORAGE = "atomic_api_key";
+const ACCESS_TOKEN_STORAGE = "atomic_access_token";
+const REFRESH_TOKEN_STORAGE = "atomic_refresh_token";
 
 /** @type {Map<string, {expires:number, data:any}>} */
 const _cache = new Map();
@@ -54,6 +56,52 @@ export function getApiKey() {
   return localStorage.getItem(API_KEY_STORAGE) || "";
 }
 
+export function setAuthTokens(data = {}) {
+  if (data.access_token) localStorage.setItem(ACCESS_TOKEN_STORAGE, data.access_token);
+  if (data.refresh_token) localStorage.setItem(REFRESH_TOKEN_STORAGE, data.refresh_token);
+}
+
+export function clearAuthTokens() {
+  localStorage.removeItem(ACCESS_TOKEN_STORAGE);
+  localStorage.removeItem(REFRESH_TOKEN_STORAGE);
+  _cache.clear();
+}
+
+export function getAccessToken() {
+  return localStorage.getItem(ACCESS_TOKEN_STORAGE) || "";
+}
+
+export function getRefreshToken() {
+  return localStorage.getItem(REFRESH_TOKEN_STORAGE) || "";
+}
+
+let _refreshing = null;
+async function refreshAccessToken() {
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) return false;
+  if (_refreshing) return _refreshing;
+  _refreshing = (async () => {
+    await ensureCsrf();
+    const headers = { "Content-Type": "application/json" };
+    const csrf = readCookie(CSRF_COOKIE);
+    if (csrf) headers[CSRF_HEADER] = csrf;
+    const res = await fetch("/api/auth/refresh", {
+      method: "POST",
+      credentials: "same-origin",
+      headers,
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+    const payload = await res.json().catch(() => null);
+    if (!res.ok || !payload || payload.status !== "success") {
+      clearAuthTokens();
+      return false;
+    }
+    setAuthTokens(payload.data || {});
+    return true;
+  })().finally(() => { _refreshing = null; });
+  return _refreshing;
+}
+
 /**
  * Core request. Returns the unwrapped `data` payload.
  * @param {string} path
@@ -79,6 +127,8 @@ export async function request(path, opts = {}) {
 
     const apiKey = getApiKey();
     if (apiKey) headers["X-API-Key"] = apiKey;
+    const accessToken = getAccessToken();
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
 
     if (opts.body !== undefined) {
       headers["Content-Type"] = "application/json";
@@ -91,7 +141,19 @@ export async function request(path, opts = {}) {
       if (token) headers[CSRF_HEADER] = token;
     }
 
-    const res = await fetch(path, init);
+    let res = await fetch(path, init);
+
+    if (
+      res.status === 401 &&
+      !opts._authRetried &&
+      !path.startsWith("/api/auth/login") &&
+      !path.startsWith("/api/auth/setup") &&
+      !path.startsWith("/api/auth/refresh") &&
+      await refreshAccessToken()
+    ) {
+      headers.Authorization = `Bearer ${getAccessToken()}`;
+      res = await fetch(path, init);
+    }
 
     if (opts.raw) return res;
 
@@ -146,4 +208,8 @@ export const api = {
   invalidate,
   setApiKey,
   getApiKey,
+  setAuthTokens,
+  clearAuthTokens,
+  getAccessToken,
+  getRefreshToken,
 };

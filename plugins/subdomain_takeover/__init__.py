@@ -243,20 +243,44 @@ class PluginScanner:
         """Perform a simple HTTP GET and return the response body text."""
         try:
             import requests
+            from urllib.parse import urljoin, urlparse
 
             for scheme in ("https", "http"):
                 try:
-                    # SSL verification is intentionally disabled because
-                    # subdomain takeover targets often have invalid or
-                    # expired certificates on the dangling endpoint.
-                    resp = requests.get(
-                        f"{scheme}://{fqdn}",
-                        timeout=10,
-                        allow_redirects=True,
-                        verify=False,
-                        headers={"User-Agent": "Mozilla/5.0"},
-                    )
-                    return resp.text
+                    current = f"{scheme}://{fqdn}"
+                    for _hop in range(4):
+                        resp = requests.get(
+                            current,
+                            timeout=10,
+                            allow_redirects=False,
+                            verify=True,
+                            stream=True,
+                            headers={"User-Agent": "ATOMIC/12.0"},
+                        )
+                        if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                            next_url = urljoin(current, resp.headers["Location"])
+                            # A takeover fingerprint redirect must remain on
+                            # the exact candidate host; never let a dangling
+                            # service turn this plugin into an SSRF client.
+                            if (urlparse(next_url).hostname or "").lower() != fqdn.lower():
+                                resp.close()
+                                break
+                            resp.close()
+                            current = next_url
+                            continue
+                        chunks = []
+                        total = 0
+                        for chunk in resp.iter_content(64 * 1024):
+                            if not chunk:
+                                continue
+                            remaining = 1024 * 1024 - total
+                            if remaining <= 0:
+                                break
+                            chunks.append(chunk[:remaining])
+                            total += min(len(chunk), remaining)
+                        encoding = resp.encoding or "utf-8"
+                        resp.close()
+                        return b"".join(chunks).decode(encoding, errors="replace")
                 except Exception:
                     continue
         except ImportError:

@@ -32,7 +32,7 @@ class ShellManager:
 
     def list_shells(self):
         """List all active shells"""
-        shells = self.db.get_shells()
+        shells = self.db.get_shells(include_secret=True)
 
         if not shells:
             print(f"{Colors.warning('No active shells found')}")
@@ -54,7 +54,7 @@ class ShellManager:
 
     def interactive_shell(self, shell_id: str):
         """Start interactive shell session"""
-        shells = self.db.get_shells()
+        shells = self.db.get_shells(include_secret=True)
 
         shell = None
         for s in shells:
@@ -108,7 +108,7 @@ class ShellManager:
     def execute_command(self, shell_id: str, cmd: str, shell=None) -> str:
         """Execute command on shell"""
         if not shell:
-            shells = self.db.get_shells()
+            shells = self.db.get_shells(include_secret=True)
             for s in shells:
                 if s["shell_id"] == shell_id or s["shell_id"].startswith(shell_id):
                     shell = s
@@ -121,7 +121,7 @@ class ShellManager:
             import requests
 
             url = shell["url"]
-            password_param = shell.get("password", "cmd")
+            password_param = shell.get("command_parameter") or "cmd"
 
             # Build request
             if "?" in url:
@@ -161,7 +161,7 @@ class ShellManager:
         print(f"  ID:       {shell['shell_id']}")
         print(f"  URL:      {shell['url']}")
         print(f"  Type:     {shell['shell_type']}")
-        print(f"  Password: {shell.get('password', 'N/A')}")
+        print(f"  Command parameter: {shell.get('command_parameter') or 'cmd'}")
         print(f"  Created:  {shell['created_at']}")
         print(f"  Last Use: {shell.get('last_used', 'Never')}")
         print()

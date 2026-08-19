@@ -942,6 +942,7 @@ class DiscoveryModule:
         print(f"{Colors.info('Attempting JS rendering discovery...')}")
 
         target_domain = urlparse(target).netloc
+        target_host = urlparse(target).hostname or ""
         rendered_urls = set()
 
         # ── Helper: extract URLs from raw page source ──
@@ -957,13 +958,17 @@ class DiscoveryModule:
 
         # ── Strategy 1: Playwright via Python ──
         playwright_script = (
-            "import sys, json\n"
+            "import sys\n"
+            "from urllib.parse import urlparse\n"
             "from playwright.sync_api import sync_playwright\n"
+            "target=sys.argv[1]\n"
+            "allowed=urlparse(target).hostname\n"
             "with sync_playwright() as p:\n"
-            "    browser = p.chromium.launch(headless=True, args=['--no-sandbox'])\n"
+            "    browser = p.chromium.launch(headless=True)\n"
             "    page = browser.new_page()\n"
-            "    page.goto(sys.argv[1], wait_until='networkidle', timeout=20000)\n"
-            "    print(page.content())\n"
+            "    page.route('**/*', lambda route: route.continue_() if urlparse(route.request.url).hostname == allowed else route.abort())\n"
+            "    page.goto(target, wait_until='networkidle', timeout=20000)\n"
+            "    print(page.content()[:2097152])\n"
             "    browser.close()\n"
         )
         try:
@@ -989,12 +994,15 @@ class DiscoveryModule:
         puppeteer_script = (
             "const puppeteer = require('puppeteer');"
             "(async () => {"
-            "  // --no-sandbox required for containerized / CI environments\n"
-            "  const browser = await puppeteer.launch({headless: 'new', args: ['--no-sandbox']});"
+            "  const target = process.argv[2];"
+            "  const allowed = new URL(target).hostname;"
+            "  const browser = await puppeteer.launch({headless: 'new'});"
             "  const page = await browser.newPage();"
-            "  await page.goto(process.argv[2], {waitUntil: 'networkidle0', timeout: 20000});"
+            "  await page.setRequestInterception(true);"
+            "  page.on('request', r => { try { new URL(r.url()).hostname === allowed ? r.continue() : r.abort(); } catch (_) { r.abort(); } });"
+            "  await page.goto(target, {waitUntil: 'networkidle0', timeout: 20000});"
             "  const html = await page.content();"
-            "  console.log(html);"
+            "  console.log(html.slice(0, 2097152));"
             "  await browser.close();"
             "})();"
         )
@@ -1022,18 +1030,19 @@ class DiscoveryModule:
             "import sys, time\n"
             "from selenium import webdriver\n"
             "from selenium.webdriver.chrome.options import Options\n"
+            "from urllib.parse import urlparse\n"
+            "target=sys.argv[1]\n"
+            "allowed=urlparse(target).hostname or ''\n"
             "opts = Options()\n"
             "opts.add_argument('--headless')\n"
-            "# WARNING: --no-sandbox disables Chrome's security sandbox.\n"
-            "# Required for containerized/CI environments but reduces browser\n"
-            "# security. Only use against trusted or controlled test targets.\n"
-            "opts.add_argument('--no-sandbox')\n"
             "opts.add_argument('--disable-dev-shm-usage')\n"
+            "opts.add_argument(f'--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE {allowed}')\n"
             "driver = webdriver.Chrome(options=opts)\n"
             "driver.set_page_load_timeout(20)\n"
-            "driver.get(sys.argv[1])\n"
+            "driver.get(target)\n"
+            "assert urlparse(driver.current_url).hostname == allowed\n"
             "time.sleep(3)\n"
-            "print(driver.page_source)\n"
+            "print(driver.page_source[:2097152])\n"
             "driver.quit()\n"
         )
         try:

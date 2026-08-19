@@ -53,7 +53,7 @@ class OSShellHandler:
         shell_info = self._find_existing_shell()
         if shell_info:
             self._shell_url = shell_info["url"]
-            self._shell_param = shell_info.get("password", "cmd")
+            self._shell_param = shell_info.get("command_parameter") or "cmd"
             print(f"{Colors.success('Reusing existing shell session')}")
         else:
             # 2. Attempt fresh upload
@@ -79,7 +79,7 @@ class OSShellHandler:
             from utils.database import Database
 
             db = Database()
-            shells = db.get_shells()
+            shells = db.get_shells(include_secret=True)
             if shells:
                 return shells[0]
         except Exception:

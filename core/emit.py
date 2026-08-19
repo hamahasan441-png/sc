@@ -166,13 +166,12 @@ def emit_signal(signal: ModuleSignal, engine) -> Optional[CanonicalFinding]:
         },
     )
 
-    # 8. Deduplicate
-    if _is_duplicate(finding, engine):
+    # 8/9. Atomically deduplicate + register.  Scan modules may emit from
+    # multiple worker threads; checking and inserting in two separate
+    # operations allows the same finding to race through twice.
+    if not _register_finding_if_new(finding, engine):
         logger.debug("Signal deduplicated: %s", finding.finding_id)
         return None
-
-    # 9. Register — bridge into legacy engine.add_finding
-    _register_finding(finding, engine)
     return finding
 
 
@@ -187,8 +186,9 @@ def bridge_legacy_finding(legacy_finding, engine) -> Optional[CanonicalFinding]:
     was invalid.
     """
     try:
+        technique = getattr(legacy_finding, "technique", "")
         signal = ModuleSignal(
-            vuln_type=getattr(legacy_finding, "technique", "").lower().split()[0] if getattr(legacy_finding, "technique", "") else "unknown",
+            vuln_type=_infer_vuln_type_from_technique(technique),
             technique=getattr(legacy_finding, "technique", ""),
             url=getattr(legacy_finding, "url", ""),
             method=getattr(legacy_finding, "method", "GET"),
@@ -264,21 +264,57 @@ def build_evidence(signal: ModuleSignal) -> Evidence:
 
 
 def build_repro(signal: ModuleSignal) -> Repro:
-    """Build a minimal replay template from the signal."""
-    if signal.injection_point in ("query", "path"):
-        from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
+    """Build a minimal replay template from the signal.
+
+    Query reconstruction deliberately preserves duplicate parameters, blank
+    values and URL fragments.  The old ``parse_qs`` -> ``dict`` round-trip
+    collapsed duplicates (common in HPP/API cases) and silently discarded the
+    fragment, so the generated reproduction could differ from the request that
+    produced the observation.
+    """
+    if signal.injection_point == "query":
+        from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
         try:
             parsed = urlparse(signal.url)
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            if signal.param:
-                qs[signal.param] = ["__PAYLOAD_PLACEHOLDER__"]
-            new_query = urlencode({k: v[0] for k, v in qs.items()})
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            replaced = False
+            rebuilt = []
+            for key, value in pairs:
+                if signal.param and key == signal.param and not replaced:
+                    rebuilt.append((key, "__PAYLOAD_PLACEHOLDER__"))
+                    replaced = True
+                else:
+                    rebuilt.append((key, value))
+            if signal.param and not replaced:
+                rebuilt.append((signal.param, "__PAYLOAD_PLACEHOLDER__"))
+            new_query = urlencode(rebuilt, doseq=True)
             url_template = urlunparse((
-                parsed.scheme, parsed.netloc, parsed.path, "", new_query, ""
+                parsed.scheme, parsed.netloc, parsed.path, parsed.params,
+                new_query, parsed.fragment
             ))
-            # Restore placeholder after URL-encoding
             url_template = url_template.replace("__PAYLOAD_PLACEHOLDER__", "{PAYLOAD}")
-        except Exception:
+        except (TypeError, ValueError):
+            url_template = signal.url
+        return Repro(method=signal.method, url_template=url_template)
+
+    if signal.injection_point == "path":
+        from urllib.parse import urlparse, urlunparse
+        try:
+            parsed = urlparse(signal.url)
+            path = parsed.path
+            if signal.param and signal.param in path:
+                path = path.replace(signal.param, "{PAYLOAD}", 1)
+            elif signal.payload and signal.payload in path:
+                path = path.replace(signal.payload, "{PAYLOAD}", 1)
+            elif not path.endswith("/"):
+                path = f"{path}/{{PAYLOAD}}"
+            else:
+                path = f"{path}{{PAYLOAD}}"
+            url_template = urlunparse((
+                parsed.scheme, parsed.netloc, path, parsed.params,
+                parsed.query, parsed.fragment
+            ))
+        except (TypeError, ValueError):
             url_template = signal.url
         return Repro(method=signal.method, url_template=url_template)
 
@@ -340,6 +376,42 @@ def score_signal(signal: ModuleSignal) -> tuple:
 # Private helpers
 # ---------------------------------------------------------------------------
 
+
+
+
+def _infer_vuln_type_from_technique(technique: str) -> str:
+    """Map legacy human-readable technique labels to canonical vuln keys.
+
+    Legacy modules historically used the first word of the technique label,
+    turning ``SQL Injection`` into ``sql`` and losing CWE/remediation mapping.
+    Keep this deterministic and conservative; unknown labels stay ``unknown``.
+    """
+    text = (technique or "").strip().lower()
+    aliases = (
+        (("sql injection", "sqli"),),
+        (("cross-site scripting", "xss"), ("cross site scripting", "xss"), (" xss", "xss")),
+        (("command injection", "cmdi"), ("os command", "cmdi")),
+        (("server-side request forgery", "ssrf"), ("ssrf", "ssrf")),
+        (("server-side template injection", "ssti"), ("ssti", "ssti")),
+        (("xml external entity", "xxe"), ("xxe", "xxe")),
+        (("local file inclusion", "lfi"), ("path traversal", "lfi"), ("lfi", "lfi")),
+        (("insecure direct object", "idor"), ("idor", "idor"), ("bola", "idor")),
+        (("nosql", "nosql"),),
+        (("cors", "cors"),),
+        (("jwt", "jwt"),),
+        (("open redirect", "open_redirect"),),
+        (("crlf", "crlf"),),
+        (("parameter pollution", "hpp"), ("hpp", "hpp")),
+        (("prototype pollution", "proto_pollution"),),
+        (("race condition", "race_condition"),),
+        (("deserialization", "deserialization"),),
+        (("file upload", "upload"), ("upload", "upload")),
+    )
+    for group in aliases:
+        for needle, canonical in group:
+            if needle.strip() in text:
+                return canonical
+    return "unknown"
 
 def _lookup_mitre_cwe(vuln_type: str) -> tuple:
     entry = _VULN_TO_MITRE_CWE.get(vuln_type.lower(), ("", ""))
@@ -413,23 +485,56 @@ def _build_request_fingerprint(signal: ModuleSignal) -> dict:
     }
 
 
+def _canonical_lock(engine):
+    """Return the engine lock used to protect finding stores, when present.
+
+    Real ``AtomicEngine`` instances expose ``_findings_lock``.  Lightweight
+    test/plugin engines may not, so ``nullcontext`` preserves compatibility.
+    """
+    from contextlib import nullcontext
+
+    return getattr(engine, "_findings_lock", None) or nullcontext()
+
+
 def _is_duplicate(finding: CanonicalFinding, engine) -> bool:
-    """Return True if a finding with the same finding_id already exists."""
-    existing = getattr(engine, "_canonical_findings", None)
-    if existing is None:
-        engine._canonical_findings = {}
-        return False
-    return finding.finding_id in engine._canonical_findings
+    """Return True if a finding with the same finding_id already exists.
+
+    Kept for compatibility with callers/tests; emission itself uses the
+    atomic ``_register_finding_if_new`` path below.
+    """
+    with _canonical_lock(engine):
+        existing = getattr(engine, "_canonical_findings", None)
+        if existing is None:
+            engine._canonical_findings = {}
+            return False
+        return finding.finding_id in existing
+
+
+def _register_finding_if_new(finding: CanonicalFinding, engine) -> bool:
+    """Atomically register *finding* if its canonical id is new.
+
+    Returns ``True`` only for the thread that performed the insertion.
+    The legacy reporting bridge runs after the canonical insertion, so a
+    failure in legacy presentation cannot lose the canonical record.
+    """
+    with _canonical_lock(engine):
+        if not hasattr(engine, "_canonical_findings"):
+            engine._canonical_findings = {}
+        if finding.finding_id in engine._canonical_findings:
+            return False
+        engine._canonical_findings[finding.finding_id] = finding
+
+    _bridge_to_legacy(finding, engine)
+    return True
 
 
 def _register_finding(finding: CanonicalFinding, engine) -> None:
-    """Store the finding in both the canonical dict and the legacy list."""
-    # Canonical store
-    if not hasattr(engine, "_canonical_findings"):
-        engine._canonical_findings = {}
-    engine._canonical_findings[finding.finding_id] = finding
+    """Backward-compatible wrapper around atomic registration."""
+    _register_finding_if_new(finding, engine)
 
-    # Bridge to legacy engine.add_finding for backward-compat reporting
+
+def _bridge_to_legacy(finding: CanonicalFinding, engine) -> None:
+    """Bridge a canonical record to the legacy reporting list."""
     try:
         from core.engine import Finding as LegacyFinding
         legacy = LegacyFinding(

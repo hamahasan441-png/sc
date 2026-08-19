@@ -321,18 +321,13 @@ def _is_tool_installed(tool_name: str) -> bool:
     """
     info = TOOL_REGISTRY.get(tool_name)
     binary = info.binary_name if info else tool_name
-    # Check PATH
-    if shutil.which(binary):
-        return True
-    # Check portable runtime bin via the integrity/simulation-aware runtime
+    # Resolve through the integrity/permissions-aware runtime. A binary in a
+    # peer-writable PATH directory must never count as installed.
     try:
         from core.tool_runtime import RUNTIME
-
-        if RUNTIME.bundled_path(binary):
-            return True
+        return RUNTIME.resolve(binary) is not None
     except Exception:
-        pass
-    return False
+        return False
 
 
 def get_install_command(tool_name: str) -> Optional[str]:
@@ -351,13 +346,9 @@ def get_install_command(tool_name: str) -> Optional[str]:
     if pkg_mgr and pkg_mgr in methods:
         return methods[pkg_mgr]
 
-    # Then try language-specific installers
-    if "go" in methods and _has_go():
-        return methods["go"]
-    if "cargo" in methods and _has_cargo():
-        return methods["cargo"]
-    if "pip" in methods and _has_pip():
-        return methods["pip"]
+    # Do not auto-run language-registry commands that use ``latest``, a
+    # branch name, or an unpinned package. Install a reviewed release from the
+    # publisher, then use ``--make-portable`` to hash-pin the binary.
 
     return None
 
@@ -401,16 +392,18 @@ def _run_install_command(cmd: str, tool_name: str, info, verbose: bool) -> bool:
     """Execute an install command and return whether the tool was installed."""
     try:
         cmd_list = shlex.split(cmd)
-        result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(
+            cmd_list,
+            timeout=600,
+            check=False,
+            env={k: v for k, v in os.environ.items() if k not in {"LD_PRELOAD", "PYTHONPATH", "PYTHONINSPECT"}},
+        )
         if result.returncode == 0 and _is_tool_installed(tool_name):
             if verbose:
                 print(f"  {Colors.GREEN}[✓]{Colors.RESET} {tool_name} — installed successfully")
             return True
         if verbose:
             print(f"  {Colors.RED}[✗]{Colors.RESET} {tool_name} — installation failed")
-            if result.stderr:
-                for line in result.stderr.strip().split("\n")[-3:]:
-                    print(f"      {line}")
             print(f"      Manual install: {info.github}")
         return False
     except subprocess.TimeoutExpired:

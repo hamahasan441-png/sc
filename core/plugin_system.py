@@ -25,6 +25,8 @@ Plugin registration:
 
 import importlib
 import importlib.util
+import hashlib
+import json
 import os
 import sys
 import threading
@@ -89,10 +91,18 @@ class PluginManager:
     def __init__(self, plugin_dir: str = ""):
         self._plugins: Dict[str, PluginInfo] = {}
         self._lock = threading.Lock()
+        explicit_plugin_dir = bool(plugin_dir)
         self._plugin_dir = plugin_dir or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "plugins",
         )
+        enforce_env = os.environ.get("ATOMIC_ENFORCE_PLUGIN_TRUST", "").strip().lower()
+        self._enforce_trust = (
+            enforce_env not in {"0", "false", "no", "off"}
+            if enforce_env
+            else not explicit_plugin_dir
+        )
+        self._trusted_hashes = self._load_trusted_hashes()
         self._hooks: Dict[str, List] = {
             "pre_scan": [],
             "post_scan": [],
@@ -102,6 +112,40 @@ class PluginManager:
             "pre_report": [],
             "post_report": [],
         }
+
+    def _load_trusted_hashes(self) -> Dict[str, str]:
+        manifest = os.path.join(self._plugin_dir, "trusted_plugins.json")
+        try:
+            if os.path.islink(manifest):
+                return {}
+            with open(manifest, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return {
+                str(name): str(digest).lower()
+                for name, digest in data.get("plugins", {}).items()
+                if isinstance(name, str) and isinstance(digest, str)
+            }
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _plugin_file_is_trusted(self, plugin_name: str, init_path: str) -> bool:
+        try:
+            if os.path.islink(init_path) or not os.path.isfile(init_path):
+                return False
+            if os.stat(init_path).st_mode & 0o022:
+                return False
+            if not self._enforce_trust:
+                return True
+            expected = self._trusted_hashes.get(plugin_name, "")
+            if len(expected) != 64:
+                return False
+            digest = hashlib.sha256()
+            with open(init_path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest() == expected
+        except OSError:
+            return False
 
     # --- Discovery & Loading ---
 
@@ -148,14 +192,14 @@ class PluginManager:
             try:
                 if os.path.islink(plugin_path):
                     continue
-                # Reject world-writable plugin dirs (supply-chain risk)
+                # Reject group/world-writable plugin dirs (supply-chain risk)
                 st = os.stat(plugin_path)
-                if st.st_mode & 0o002:
+                if st.st_mode & 0o022:
                     continue
             except OSError:
                 continue
             init_path = os.path.join(plugin_path, "__init__.py")
-            if os.path.isdir(plugin_path) and os.path.isfile(init_path):
+            if os.path.isdir(plugin_path) and self._plugin_file_is_trusted(entry, init_path):
                 discovered.append(entry)
         return discovered
 
@@ -178,7 +222,7 @@ class PluginManager:
             return None
 
         init_path = os.path.join(plugin_path, "__init__.py")
-        if not os.path.isfile(init_path):
+        if not self._plugin_file_is_trusted(plugin_name, init_path):
             return None
 
         try:
@@ -312,7 +356,6 @@ class PluginManager:
     def run_plugin(self, name: str, target: str, params: Optional[list] = None, engine: Any = None) -> PluginResult:
         """Execute a single plugin with timeout and bounded resources."""
         import time
-        import concurrent.futures
 
         plugin = self._plugins.get(name)
         if not plugin or not plugin.enabled or not plugin.instance:
@@ -339,17 +382,34 @@ class PluginManager:
                 _timeout = 30
             _timeout = max(5, min(_timeout, 300))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_exec)
+            outcome = []
+            failure = []
+            finished = threading.Event()
+
+            def _daemon_exec():
                 try:
-                    findings = future.result(timeout=_timeout)
-                except concurrent.futures.TimeoutError:
-                    return PluginResult(
-                        plugin_name=name,
-                        success=False,
-                        error=f"Plugin execution timed out after {_timeout}s",
-                        duration_seconds=float(_timeout),
-                    )
+                    outcome.append(_exec())
+                except BaseException as exc:  # isolate plugin failures
+                    failure.append(exc)
+                finally:
+                    finished.set()
+
+            worker = threading.Thread(
+                target=_daemon_exec,
+                daemon=True,
+                name=f"atomic-plugin-{name[:40]}",
+            )
+            worker.start()
+            if not finished.wait(_timeout):
+                return PluginResult(
+                    plugin_name=name,
+                    success=False,
+                    error=f"Plugin execution timed out after {_timeout}s",
+                    duration_seconds=float(_timeout),
+                )
+            if failure:
+                raise failure[0]
+            findings = outcome[0] if outcome else []
 
             duration = time.time() - start
             # Bound findings count to prevent memory exhaustion

@@ -5,11 +5,22 @@ ATOMIC FRAMEWORK - Helper Utilities
 """
 
 import sys
+import os
 import subprocess
 import platform
 from urllib.parse import urlparse, urlunparse
 
 from config import Colors
+
+
+def spreadsheet_safe(value):
+    """Neutralize spreadsheet formulas while preserving ordinary scalar values."""
+    if not isinstance(value, str):
+        return value
+    probe = value.lstrip(" ")
+    if probe.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
 
 
 def build_origin_target(target: str, origin_ip: str) -> str:
@@ -110,33 +121,23 @@ def check_dependencies():
 
 
 def install_deps():
-    """Install all dependencies"""
-    print(f"{Colors.info('Installing dependencies...')}")
-
-    deps = [
-        "requests",
-        "beautifulsoup4",
-        "sqlalchemy",
-        "fpdf2",
-        "PyJWT",
-        "urllib3",
-        "flask",
-        "flask-socketio",
-        "flask-cors",
-        "pysocks",
-        "colorama",
-        "tqdm",
-    ]
-
-    for dep in deps:
-        print(f"{Colors.info(f'Installing {dep}...')}")
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", dep, "-q"], check=True)
-            print(f"  {Colors.success(f'{dep} installed')}")
-        except subprocess.CalledProcessError:
-            print(f"  {Colors.error(f'Failed to install {dep}')}")
-
+    """Install the reviewed, exact dependency set from ``requirements.txt``."""
+    requirements = os.path.join(os.path.dirname(os.path.dirname(__file__)), "requirements.txt")
+    if not os.path.isfile(requirements):
+        print(f"{Colors.error('requirements.txt not found')}")
+        return False
+    print(f"{Colors.info('Installing pinned dependencies from requirements.txt...')}")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--requirement", requirements],
+            check=True,
+            timeout=1800,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"{Colors.error(f'Dependency installation failed: {exc}')}")
+        return False
     print(f"\n{Colors.success('Installation complete!')}")
+    return True
 
 
 def get_system_info():

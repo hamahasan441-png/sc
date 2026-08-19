@@ -264,6 +264,11 @@ class AtomicEngine:
                 policy = NetworkSecurityPolicy(
                     allowed_domains=list(scope_domains),
                     block_private=policy.block_private,
+                    enforce_domains=True,
+                    resolve_dns=policy.resolve_dns,
+                    # A private/LAN target is available only when it was
+                    # explicitly selected for an authorized owner scan.
+                    allow_private_scoped=bool(self.config.get("authorized", False)),
                 )
             if policy.active:
                 self.net_policy = policy
@@ -550,9 +555,15 @@ class AtomicEngine:
                 cvss=float(finding_dict.get("cvss", 0.0)),
             )
             with self._findings_lock:
-                self.findings.append(f)
+                # Keep the canonical store authoritative and deduplicated.
+                # Historically this method created a CanonicalFinding but
+                # appended it only to the legacy list, making it invisible
+                # to get_canonical_findings(), persistence and output phases.
+                if f.finding_id not in self._canonical_findings:
+                    self._canonical_findings[f.finding_id] = f
+                    self.findings.append(f)
         except Exception:
-            # Fallback: store the raw dict
+            # Fallback: store the raw dict for legacy/plugin compatibility.
             with self._findings_lock:
                 self.findings.append(finding_dict)
 
@@ -1556,20 +1567,30 @@ class AtomicEngine:
         # nothing — the bug noted in LOGIC_MAP.md "Known Drift #3".
         if modules_config.get("shell", False) and self.findings:
             try:
+                from core.authorization import require_authorized
+                require_authorized("shell-upload", target=target)
                 from modules.uploader import ShellUploader
 
                 uploader = ShellUploader(self, scan_only=False)
                 uploader.run(self.findings, forms)
+            except (ImportError, PermissionError) as e:
+                if self.config.get("verbose"):
+                    print(f"{Colors.warning(f'Shell upload blocked: {e}')}")
             except Exception as e:
                 if self.config.get("verbose"):
                     print(f"{Colors.error(f'Shell upload error: {e}')}")
 
         if modules_config.get("dump", False) and self.findings:
             try:
+                from core.authorization import require_authorized
+                require_authorized("data-dump", target=target)
                 from modules.dumper import DataDumper
 
                 dumper = DataDumper(self)
                 dumper.run(self.findings)
+            except (ImportError, PermissionError) as e:
+                if self.config.get("verbose"):
+                    print(f"{Colors.warning(f'Data dump blocked: {e}')}")
             except Exception as e:
                 if self.config.get("verbose"):
                     print(f"{Colors.error(f'Data dump error: {e}')}")
@@ -1961,7 +1982,15 @@ class AtomicEngine:
         These are richer than the legacy ``self.findings`` list and include
         full evidence, repro, and verification metadata.
         """
-        return list(self._canonical_findings.values())
+        # Return a snapshot under the same lock used by emit/register so
+        # callers never observe a dictionary while another worker mutates it.
+        # Lightweight plugin/test engine instances may be constructed without
+        # running ``__init__``; keep those compatible instead of crashing.
+        lock = getattr(self, "_findings_lock", None)
+        if lock is None:
+            return list(getattr(self, "_canonical_findings", {}).values())
+        with lock:
+            return list(getattr(self, "_canonical_findings", {}).values())
 
     def _print_attack_results(self):
         """Display rich attack/exploitation results in the console."""

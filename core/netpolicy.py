@@ -8,8 +8,10 @@ Single choke point for outbound-request safety:
 * scheme validation (http/https only),
 * hostname normalization (incl. alternative IP notations, via ScopePolicy),
 * label-aware domain allowlisting,
-* optional private/loopback/link-local/metadata blocking
-  (``ATOMIC_BLOCK_PRIVATE_TARGETS=1``) for shared deployments.
+* private/loopback/link-local/metadata blocking by default,
+* DNS resolution before every hop so hostnames resolving to private ranges are
+  treated exactly like literal private IP addresses,
+* an explicit scoped-private exception for owner-authorized scans.
 
 Consumers:
 * ``utils/requester.Requester`` — validates the request URL and every
@@ -20,13 +22,15 @@ Consumers:
   backward compatibility; both delegate to the same matching rules.
 
 The policy is fail-closed: any parse/validation error denies the request.
-DNS-rebinding protection (resolving and pinning before connect) is NOT in
-scope here — documented residual risk, see audit report.
+Redirect targets are resolved and validated before connection.  Connection-IP
+pinning remains transport-adapter specific, so consumers must re-check every
+hop immediately before dispatch.
 """
 from __future__ import annotations
 
 import ipaddress
 import os
+import socket
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
@@ -61,12 +65,16 @@ class NetworkSecurityPolicy:
         allowed_domains: Optional[list] = None,
         block_private: bool = False,
         enforce_domains: bool = False,
+        resolve_dns: bool = False,
+        allow_private_scoped: bool = False,
     ) -> None:
         from core.scope import ScopePolicy  # local import: avoid cycles
 
         self._normalize = ScopePolicy._normalize_hostname
         self.block_private = bool(block_private)
         self.enforce_domains = bool(enforce_domains)
+        self.resolve_dns = bool(resolve_dns)
+        self.allow_private_scoped = bool(allow_private_scoped)
         self.allowed_domains = set()
         for d in allowed_domains or []:
             norm = self._normalize(str(d).strip())
@@ -86,8 +94,12 @@ class NetworkSecurityPolicy:
         domains = [x.strip() for x in raw.split(",") if x.strip()] if raw else []
         return cls(
             allowed_domains=domains,
-            block_private=_truthy_env("ATOMIC_BLOCK_PRIVATE_TARGETS"),
+            # Safe default for the web/repeater surface. Owner-authorized scan
+            # targets get a narrowly scoped exception from AtomicEngine.
+            block_private=not _truthy_env("ATOMIC_ALLOW_PRIVATE_TARGETS"),
             enforce_domains=_truthy_env("ATOMIC_TOOL_SCOPE_STRICT") or bool(domains),
+            resolve_dns=not _truthy_env("ATOMIC_DISABLE_DNS_POLICY"),
+            allow_private_scoped=_truthy_env("ATOMIC_ALLOW_PRIVATE_SCOPED"),
         )
 
     @property
@@ -98,6 +110,35 @@ class NetworkSecurityPolicy:
     # ------------------------------------------------------------------
     # Checks
     # ------------------------------------------------------------------
+
+    def _host_is_explicitly_scoped(self, host: str) -> bool:
+        norm = self._normalize(host or "")
+        if not norm:
+            return False
+        return norm in self.allowed_domains or any(
+            norm.endswith("." + base) for base in self.allowed_domains if base
+        )
+
+    def _resolve_host_ips(self, host: str):
+        """Resolve all A/AAAA records without caching (fail closed on errors)."""
+        norm = self._normalize((host or "").strip().lower().strip("[]"))
+        try:
+            return {ipaddress.ip_address(norm)}
+        except ValueError:
+            pass
+        if not self.resolve_dns:
+            return set()
+        try:
+            records = socket.getaddrinfo(norm, None, type=socket.SOCK_STREAM)
+        except (socket.gaierror, OSError):
+            return None
+        addresses = set()
+        for record in records:
+            try:
+                addresses.add(ipaddress.ip_address(record[4][0].split("%", 1)[0]))
+            except (ValueError, IndexError, TypeError):
+                return None
+        return addresses or None
 
     def is_private_host(self, host: str) -> bool:
         """True for loopback/RFC1918/link-local/metadata hosts (IP or name)."""
@@ -110,7 +151,15 @@ class NetworkSecurityPolicy:
         try:
             ip = ipaddress.ip_address(norm or h)
         except ValueError:
-            return False  # ordinary hostname; DNS pinning out of scope
+            if not self.resolve_dns:
+                return False
+            addresses = self._resolve_host_ips(norm or h)
+            if addresses is None:
+                return True
+            return any(
+                any(ip in net for net in _PRIVATE_NETWORKS)
+                for ip in addresses
+            )
         return any(ip in net for net in _PRIVATE_NETWORKS)
 
     def is_host_allowed(self, host: str) -> bool:
@@ -118,7 +167,8 @@ class NetworkSecurityPolicy:
         if not norm:
             return False
         if self.block_private and self.is_private_host(norm):
-            return False
+            if not (self.allow_private_scoped and self._host_is_explicitly_scoped(norm)):
+                return False
         if not self.enforce_domains:
             return True
         if norm in self.allowed_domains:
@@ -140,6 +190,12 @@ class NetworkSecurityPolicy:
         host = parsed.hostname or ""
         if not host:
             return False, "missing host"
+        if self.resolve_dns:
+            try:
+                ipaddress.ip_address(self._normalize(host) or host)
+            except ValueError:
+                if self._resolve_host_ips(host) is None:
+                    return False, f"DNS resolution failed for '{host}'"
         if not self.is_host_allowed(host):
             return False, f"host '{host}' outside network policy"
         return True, "ok"

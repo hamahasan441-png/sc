@@ -11,14 +11,15 @@ version string.  When releasing a new version, change it here only.
 
 import os
 import random
+import tempfile
 
 
 class Config:
     """Main Configuration"""
 
     # Version Info — CANONICAL.  Do not duplicate elsewhere.
-    VERSION = "11.0"
-    CODENAME = "TITAN"
+    VERSION = "12.0"
+    CODENAME = "TITAN OWNER"
     AUTHOR = "Atomic Security"
 
     # Paths
@@ -42,8 +43,13 @@ class Config:
     try:
         os.makedirs(ATOMIC_HOME, exist_ok=True)
     except OSError:
-        # Fall back to source tree if the user's home is unwritable.
-        ATOMIC_HOME = BASE_DIR
+        # Never write secrets or scan data into the source tree.
+        ATOMIC_HOME = os.path.join(tempfile.gettempdir(), f"atomic-{os.geteuid()}")
+        os.makedirs(ATOMIC_HOME, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(ATOMIC_HOME, 0o700)
+    except OSError:
+        pass
 
     REPORTS_DIR = os.path.join(ATOMIC_HOME, "reports")
     SHELLS_DIR = os.path.join(ATOMIC_HOME, "shells")
@@ -61,7 +67,7 @@ class Config:
     # ── Self-update ──────────────────────────────────────────────────
     # Repository the built-in updater tracks (--update / --check-update).
     # Override to point at a fork, e.g. ATOMIC_UPDATE_REPO=owner/repo.
-    UPDATE_REPO = os.environ.get("ATOMIC_UPDATE_REPO", "hamahasan441-png/Scanner-").strip()
+    UPDATE_REPO = os.environ.get("ATOMIC_UPDATE_REPO", "hamahasan441-png/sc").strip()
     UPDATE_BRANCH = os.environ.get("ATOMIC_UPDATE_BRANCH", "main").strip()
     # Non-blocking "update available" notice on startup. Disable with
     # ATOMIC_NO_UPDATE_CHECK=1 (or the --no-update-check flag). The check

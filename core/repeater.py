@@ -5,7 +5,7 @@ Repeater - Manual HTTP Request Replay & Modification Tool"""
 
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -83,9 +83,20 @@ class RepeaterResponse:
 class Repeater:
     """Burp-style HTTP request repeater for manual replay and modification."""
 
-    def __init__(self, timeout=15, proxy=None, verify_ssl=False):
+    def __init__(
+        self,
+        timeout=15,
+        proxy=None,
+        verify_ssl=True,
+        network_policy=None,
+        max_response_bytes=1024 * 1024,
+        max_redirects=10,
+    ):
         self.timeout = timeout
         self.verify_ssl = verify_ssl
+        self.network_policy = network_policy
+        self.max_response_bytes = min(10 * 1024 * 1024, max(64 * 1024, int(max_response_bytes)))
+        self.max_redirects = min(20, max(0, int(max_redirects)))
         self.session = requests.Session()
         self._history = []
 
@@ -110,22 +121,121 @@ class Repeater:
         req_body = body
 
         start = time.monotonic()
-        resp = self.session.request(
-            method=method,
-            url=url,
-            headers=headers,
-            data=body,
-            params=params,
-            cookies=cookies,
-            allow_redirects=allow_redirects,
-            timeout=self.timeout,
-            verify=self.verify_ssl,
-        )
+        current_method = method
+        current_url = url
+        current_headers = dict(req_headers)
+        current_body = body
+        current_params = params
+        history = []
+        resp = None
+
+        for hop in range(self.max_redirects + 1):
+            self._require_allowed(current_url)
+            resp = self.session.request(
+                method=current_method,
+                url=current_url,
+                headers=current_headers,
+                data=current_body,
+                params=current_params,
+                cookies=cookies,
+                allow_redirects=False,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+                stream=True,
+            )
+            status = int(getattr(resp, "status_code", 0) or 0)
+            location = str(getattr(resp, "headers", {}).get("Location") or "").strip()
+            if not allow_redirects or status not in (301, 302, 303, 307, 308) or not location:
+                break
+            if hop >= self.max_redirects:
+                resp.close()
+                raise requests.TooManyRedirects(f"Exceeded {self.max_redirects} redirects")
+            next_url = urljoin(getattr(resp, "url", "") or current_url, location)
+            self._require_allowed(next_url)
+            next_headers = dict(current_headers)
+            if self._origin(current_url) != self._origin(next_url):
+                for name in list(next_headers):
+                    if name.lower() in {"authorization", "cookie", "proxy-authorization", "host"}:
+                        next_headers.pop(name, None)
+            resp.close()
+            history.append(resp)
+            current_url = next_url
+            current_headers = next_headers
+            current_params = None
+            if status == 303 or (status in (301, 302) and current_method not in ("GET", "HEAD")):
+                current_method = "GET"
+                current_body = None
+                for name in list(current_headers):
+                    if name.lower() in {"content-length", "content-type", "transfer-encoding"}:
+                        current_headers.pop(name, None)
+
+        if resp is None:
+            raise requests.RequestException("No response returned")
+        try:
+            resp.history = history
+        except Exception:
+            pass
+        self._read_bounded(resp)
         elapsed = time.monotonic() - start
 
         rr = self._build_response(resp, method, req_headers, req_body, elapsed)
         self._record(method, url, req_headers, req_body, params, cookies, allow_redirects, rr)
         return rr
+
+    @staticmethod
+    def _origin(url):
+        parsed = urlparse(url)
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
+
+    def _require_allowed(self, url):
+        if self.network_policy is None:
+            return
+        try:
+            allowed, reason = self.network_policy.allow_url(url)
+        except Exception as exc:
+            raise PermissionError(f"URL denied by network policy: {exc}") from exc
+        if not allowed:
+            raise PermissionError(f"URL denied by network policy: {reason}")
+
+    def _read_bounded(self, resp):
+        """Read at most the configured response limit and close the socket."""
+        limit = self.max_response_bytes
+        truncated = False
+        if isinstance(resp, requests.Response):
+            chunks = []
+            total = 0
+            try:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    remaining = limit - total
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    chunks.append(chunk[:remaining])
+                    total += min(len(chunk), remaining)
+                    if len(chunk) > remaining:
+                        truncated = True
+                        break
+                resp._content = b"".join(chunks)
+                resp._content_consumed = True
+            finally:
+                resp.close()
+        else:
+            # Lightweight test doubles do not provide a real streaming body.
+            raw = getattr(resp, "content", b"")
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8", errors="replace")
+            if isinstance(raw, (bytes, bytearray)) and len(raw) > limit:
+                resp.content = bytes(raw[:limit])
+                resp.text = resp.content.decode("utf-8", errors="replace")
+                truncated = True
+        if truncated:
+            try:
+                resp.headers["X-Atomic-Response-Truncated"] = "true"
+            except Exception:
+                pass
 
     def send_raw(self, raw_request, host=None, port=80, use_ssl=False):
         """Parse a raw HTTP request string and send it.

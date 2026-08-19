@@ -161,6 +161,9 @@ class BruteForceModule:
             Successfully cracked credentials (``url``, ``username``,
             ``password``).
         """
+        from core.authorization import require_authorized
+        require_authorized("credential-bruteforce", target=getattr(self.engine, "target", None))
+
         usernames = usernames or DEFAULT_USERNAMES
         passwords = passwords or DEFAULT_PASSWORDS
 

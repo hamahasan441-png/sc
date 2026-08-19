@@ -21,9 +21,70 @@ not require both env and CLI — either is sufficient but both are
 deliberately not auto-set by the framework.
 """
 from __future__ import annotations
+import json
 import os
 import sys
+import secrets
+from datetime import datetime, timezone
 from typing import Optional
+
+
+def _authorization_file() -> str:
+    root = os.environ.get("ATOMIC_HOME", "").strip()
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".atomic")
+    return os.environ.get(
+        "ATOMIC_OWNER_AUTHORIZATION_FILE",
+        os.path.join(root, "owner_authorization.json"),
+    )
+
+
+def acknowledge_owner_authorization(username: str) -> None:
+    """Persist the first-run owner's authorized-use acknowledgement.
+
+    This is written only by the one-time web setup flow after the operator
+    checks the authorized-use confirmation.  It gives the local owner the same
+    durable capability as ``ATOMIC_AUTHORIZED=1`` without hard-coding that env
+    flag into the shipped image.
+    """
+    path = _authorization_file()
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    payload = {
+        "version": 1,
+        "authorized": True,
+        "username": str(username)[:64],
+        "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+    }
+    data = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    temp_path = f"{path}.tmp-{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temp_path, flags, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temp_path, path)
+    os.chmod(path, 0o600)
+
+
+def _owner_authorized() -> bool:
+    path = _authorization_file()
+    try:
+        if os.path.islink(path):
+            return False
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload.get("authorized") is True and bool(payload.get("username"))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def is_authorized() -> bool:
@@ -32,6 +93,8 @@ def is_authorized() -> bool:
     if env in ("1", "true", "yes", "on"):
         return True
     if "--authorized" in sys.argv[1:]:
+        return True
+    if _owner_authorized():
         return True
     return False
 

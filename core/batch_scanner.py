@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import concurrent.futures
+import html as _html
 import logging
 import os
 import time
@@ -284,18 +285,25 @@ class BatchScanner:
                 # HTML consolidated report
                 rows = ""
                 for r in batch_result.target_results:
+                    # Batch inputs and scanner errors can contain arbitrary
+                    # text. Escape every dynamic field before embedding it in
+                    # the standalone HTML report.
                     sev_html = "  ".join(
-                        f'<span class="sev-{s.lower()}">{s}: {c}</span>'
-                        for s, c in r.severity_counts().items()
+                        f'<span class="sev-{_html.escape(str(sev).lower(), quote=True)}">'
+                        f'{_html.escape(str(sev))}: {int(count)}</span>'
+                        for sev, count in r.severity_counts().items()
                     )
                     status_cls = "error" if r.error else "ok"
+                    target_html = _html.escape(str(r.target), quote=True)
+                    error_html = _html.escape(str(r.error), quote=True) if r.error else ""
+                    status_html = "❌ " + error_html if r.error else "✅"
                     rows += (
                         f'<tr class="{status_cls}">'
-                        f"<td>{r.target}</td>"
+                        f"<td>{target_html}</td>"
                         f"<td>{r.findings_count}</td>"
                         f"<td>{sev_html}</td>"
                         f"<td>{r.elapsed_seconds:.1f}s</td>"
-                        f"<td>{'❌ ' + r.error if r.error else '✅'}</td>"
+                        f"<td>{status_html}</td>"
                         "</tr>\n"
                     )
 

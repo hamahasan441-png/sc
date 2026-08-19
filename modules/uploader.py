@@ -164,6 +164,10 @@ class ShellUploader(BaseModule):
         """
         if self.scan_only:
             return
+        # Defense in depth: callers must not be able to bypass the central
+        # engine gate by instantiating ShellUploader directly.
+        from core.authorization import require_authorized
+        require_authorized("shell-upload", target=getattr(self.engine, "target", None))
         print(f"{Colors.info('Attempting shell uploads...')}")
 
         # Try upload via file upload forms

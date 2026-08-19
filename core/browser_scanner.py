@@ -24,6 +24,7 @@ import logging
 import re
 import time
 from typing import TYPE_CHECKING, List
+from urllib.parse import urlparse
 
 from config import Colors
 
@@ -107,6 +108,25 @@ class BrowserScanner:
             return "selenium"
         return "none"
 
+    def _browser_url_allowed(self, url: str) -> bool:
+        """Apply the engine network/scope policy to every browser request."""
+        policy = getattr(self.engine, "net_policy", None)
+        if policy is not None:
+            try:
+                allowed, _reason = policy.allow_url(url)
+                if not allowed:
+                    return False
+            except Exception:
+                return False
+        scope = getattr(self.engine, "scope", None)
+        if scope is not None and getattr(scope, "strict_scope", False):
+            try:
+                if not scope.is_in_scope(url):
+                    return False
+            except Exception:
+                return False
+        return True
+
     # ------------------------------------------------------------------
     # Playwright implementation
     # ------------------------------------------------------------------
@@ -118,10 +138,18 @@ class BrowserScanner:
             from playwright.sync_api import sync_playwright
 
             with sync_playwright() as pw:
+                # Chromium sandbox stays enabled. Run the scanner as a non-root
+                # user (the supplied Docker image does this by default).
                 browser = pw.chromium.launch(headless=True)
                 context = browser.new_context(
                     java_script_enabled=True,
-                    ignore_https_errors=True,
+                    ignore_https_errors=not bool(getattr(self.engine.requester, "_verify_tls", True)),
+                )
+                context.route(
+                    "**/*",
+                    lambda route, request: (
+                        route.continue_() if self._browser_url_allowed(request.url) else route.abort()
+                    ),
                 )
                 page = context.new_page()
 
@@ -155,10 +183,12 @@ class BrowserScanner:
 
     def _scan_url_playwright(self, page, url, alerts, console_errors, findings):
         """Scan a single URL with Playwright for DOM-XSS."""
+        if not self._browser_url_allowed(url):
+            return
         page.goto(url, timeout=self.timeout, wait_until="networkidle")
 
         # Capture page source for sink analysis
-        content = page.content()
+        content = page.content()[: 2 * 1024 * 1024]
         sinks = self._detect_dom_sinks(content)
 
         # Inject DOM XSS payloads into URL fragments
@@ -214,17 +244,27 @@ class BrowserScanner:
 
             opts = Options()
             opts.add_argument("--headless")
-            opts.add_argument("--no-sandbox")
             opts.add_argument("--disable-dev-shm-usage")
-            opts.add_argument("--ignore-certificate-errors")
+            if not bool(getattr(self.engine.requester, "_verify_tls", True)):
+                opts.add_argument("--ignore-certificate-errors")
+            if urls:
+                allowed_host = urlparse(urls[0]).hostname or ""
+                if allowed_host:
+                    opts.add_argument(
+                        f"--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE {allowed_host}"
+                    )
 
             driver = webdriver.Chrome(options=opts)
             driver.set_page_load_timeout(self.timeout // 1000)
 
             for url in urls[:50]:
                 try:
+                    if not self._browser_url_allowed(url):
+                        continue
                     driver.get(url)
-                    content = driver.page_source
+                    if not self._browser_url_allowed(driver.current_url):
+                        continue
+                    content = driver.page_source[: 2 * 1024 * 1024]
                     sinks = self._detect_dom_sinks(content)
 
                     for payload in DOM_XSS_PAYLOADS[:3]:

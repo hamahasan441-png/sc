@@ -82,6 +82,29 @@ class ToolRuntime:
             self.require_bundled = False
         self._manifest = self._load_manifest()
 
+    @staticmethod
+    def _trusted_host_path(name: str) -> Optional[str]:
+        """Resolve a PATH tool only when its file and parent chain are not writable by peers."""
+        candidate = shutil.which(name)
+        if not candidate:
+            return None
+        try:
+            path = Path(candidate).resolve(strict=True)
+            if not path.is_file() or not os.access(path, os.X_OK):
+                return None
+            st = path.stat()
+            if st.st_uid not in {0, os.geteuid()} or st.st_mode & 0o022:
+                return None
+            parent = path.parent
+            while parent != parent.parent:
+                pst = parent.stat()
+                if pst.st_mode & 0o022:
+                    return None
+                parent = parent.parent
+            return str(path)
+        except (OSError, RuntimeError):
+            return None
+
     def _load_manifest(self) -> Dict[str, ToolSpec]:
         if not self.manifest_path.is_file():
             return {}
@@ -168,7 +191,7 @@ class ToolRuntime:
             return bundled
         if self.require_bundled:
             return None
-        return shutil.which(name)
+        return self._trusted_host_path(name)
 
     def status(self) -> Dict[str, dict]:
         # Include all known tools from manifests and common security tools
@@ -184,12 +207,12 @@ class ToolRuntime:
         out = {}
         for name in sorted(names):
             bundled = self.bundled_path(name)
-            host = shutil.which(name)
+            host = self._trusted_host_path(name)
             simulated = self.is_simulated(name)
             out[name] = {
                 "available": bool(bundled or (host and self.allow_host_tools)),
                 "source": "bundled" if bundled else ("host" if host and self.allow_host_tools else "none"),
-                "integrity": "verified" if bundled else ("unverified-host" if host and self.allow_host_tools else "missing"),
+                "integrity": "verified" if bundled else ("trusted-host" if host and self.allow_host_tools else "missing"),
                 "bundled_path": bundled,
                 "host_path": host,
                 # SEC-013: transparent provenance — dashboards/APIs must be
@@ -239,7 +262,7 @@ class ToolRuntime:
 
         results = {}
         for name in tools_to_process:
-            host_path = _shutil.which(name)
+            host_path = self._trusted_host_path(name)
             if not host_path:
                 results[name] = {"success": False, "error": "not found on host"}
                 continue
@@ -284,6 +307,13 @@ class ToolRuntime:
         Attempts to use Go, apt, brew, pip etc to install tools.
         Returns status dict.
         """
+        if os.environ.get("ATOMIC_ALLOW_TOOL_INSTALL", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return {
+                "error": (
+                    "Automatic tool installation is disabled. Review the pinned setup commands, "
+                    "then set ATOMIC_ALLOW_TOOL_INSTALL=1 for an explicit owner-authorized install."
+                )
+            }
         try:
             from utils.tool_downloader import TOOL_REGISTRY, _is_tool_installed, install_tool
             results = {}

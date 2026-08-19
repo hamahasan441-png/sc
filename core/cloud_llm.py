@@ -239,11 +239,14 @@ class CloudLLM(LLMSecurityAnalysisMixin):
         import subprocess
         import sys
 
+        if os.environ.get("ATOMIC_ALLOW_PIP_INSTALL", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            print(f"{Colors.warning('Automatic pip installation is disabled; use the pinned full setup explicitly.')}")
+            return False
         pkg = {
-            "litellm": "litellm",
-            "anthropic": "anthropic",
-            "openai": "openai",
-        }.get(prefer, "litellm")
+            "litellm": "litellm==1.77.7",
+            "anthropic": "anthropic==0.67.0",
+            "openai": "openai==1.109.1",
+        }.get(prefer, "litellm==1.77.7")
         print(f"{Colors.info(f'Installing {pkg} ...')}")
         try:
             subprocess.check_call(
@@ -272,12 +275,8 @@ class CloudLLM(LLMSecurityAnalysisMixin):
 
         backend = self._select_backend()
         if not backend:
-            print(
-                f"{Colors.warning('No LLM client library found. Installing litellm...')}"
-            )
-            if not self.install_backend("litellm"):
-                return False
-            backend = self._select_backend()
+            print(f"{Colors.warning('No compatible LLM backend is installed; run the pinned full setup first.')}")
+            return False
 
         self._backend = backend
         return backend is not None

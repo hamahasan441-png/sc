@@ -6,6 +6,7 @@ Advanced HTTP request handler with evasion, response caching, and metrics
 """
 
 import hashlib
+import json
 import logging
 import os
 import random
@@ -15,7 +16,7 @@ import threading
 import unicodedata
 import warnings
 from collections import OrderedDict
-from urllib.parse import urlencode, quote, urlparse, parse_qs, urlunparse
+from urllib.parse import urlencode, quote, urljoin, urlparse, parse_qs, urlunparse
 
 _logger = logging.getLogger(__name__)
 
@@ -330,7 +331,14 @@ class Requester:
         cache_size = config.get("cache_size", 2000)
         cache_ttl = config.get("cache_ttl", 300.0)
         self._cache = ResponseCache(max_size=cache_size, ttl=cache_ttl)
-        self._cache_enabled = config.get("response_cache", True)
+        # Active probes are header- and auth-sensitive. Cache is therefore
+        # opt-in; callers may enable it only for deliberate baseline/recon
+        # requests, whose complete effective headers are part of the key.
+        self._cache_enabled = bool(config.get("response_cache", False))
+        try:
+            self._max_redirects = min(20, max(0, int(config.get("max_redirects", 10))))
+        except (TypeError, ValueError):
+            self._max_redirects = 10
 
         # Scan metrics
         self.metrics = ScanMetrics()
@@ -674,8 +682,9 @@ class Requester:
         """Build a deterministic cache key for a request.
 
         Only GET requests are cacheable (baseline/recon probes).
-        Auth-bearing headers are hashed into the key so two callers
-        with different cookies/tokens never share a cached body.
+        All effective headers are hashed into the key. Scanner probes often
+        vary ``Origin``, ``Host`` or forwarding headers; omitting any of them
+        can turn a cache hit into a false positive/negative.
         Returns empty string for non-cacheable requests.
         """
         if method.upper() != "GET":
@@ -683,17 +692,16 @@ class Requester:
         parts = [url]
         if data and isinstance(data, dict):
             parts.append(str(sorted(data.items())))
-        auth_scope = ""
+        header_scope = ""
         if headers and isinstance(headers, dict):
-            # Case-insensitive lookup; hash so the key does not retain secrets.
-            lowered = {str(k).lower(): str(v) for k, v in headers.items()}
-            scope_bits = []
-            for name in ("authorization", "cookie", "proxy-authorization"):
-                if name in lowered and lowered[name]:
-                    scope_bits.append(f"{name}={lowered[name]}")
-            if scope_bits:
-                auth_scope = hashlib.sha256("|".join(scope_bits).encode("utf-8")).hexdigest()[:16]
-        parts.append(auth_scope or "anon")
+            normalized = sorted(
+                (str(k).strip().lower(), str(v)) for k, v in headers.items()
+            )
+            if normalized:
+                header_scope = hashlib.sha256(
+                    json.dumps(normalized, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()[:24]
+        parts.append(header_scope or "no-headers")
         return "|".join(parts)
 
     def _check_cache(self, url: str, method: str, data, files, headers=None) -> tuple:
@@ -780,6 +788,110 @@ class Requester:
         if upper_method == "PUT":
             return self.session.put(url, data=data, **common)
         return self.session.request(upper_method, url, data=data, **common)
+
+    @staticmethod
+    def _origin(url: str) -> tuple:
+        parsed = urlparse(url)
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
+
+    def _dispatch_with_validated_redirects(
+        self, url, method, data, req_headers, files, timeout, allow_redirects
+    ):
+        """Follow redirects manually, validating the next URL before connect."""
+        current_url = url
+        current_method = method.upper()
+        current_data = data
+        current_files = files
+        current_headers = dict(req_headers or {})
+        history = []
+
+        for hop in range(self._max_redirects + 1):
+            if not self._policy_allows(current_url):
+                for prior in history:
+                    try:
+                        prior.close()
+                    except Exception:
+                        pass
+                return None
+
+            response = self._dispatch_request(
+                current_url,
+                current_method,
+                current_data,
+                current_headers,
+                current_files,
+                timeout,
+                False,
+            )
+            status = int(getattr(response, "status_code", 0) or 0)
+            location = ""
+            try:
+                location = str(response.headers.get("Location") or "").strip()
+            except Exception:
+                location = ""
+            if not allow_redirects or status not in (301, 302, 303, 307, 308) or not location:
+                try:
+                    response.history = history
+                except Exception:
+                    pass
+                return response
+            if hop >= self._max_redirects:
+                response.close()
+                raise requests.exceptions.TooManyRedirects(
+                    f"Exceeded {self._max_redirects} redirects"
+                )
+            if current_files:
+                # File objects are not reliably replayable after the first
+                # upload. Return the redirect rather than sending a corrupted
+                # or partial second request.
+                try:
+                    response.history = history
+                    response.headers["X-Atomic-Redirect-Not-Followed"] = "upload-body"
+                except Exception:
+                    pass
+                return response
+
+            next_url = urljoin(getattr(response, "url", "") or current_url, location)
+            if not self._policy_allows(next_url):
+                response.close()
+                for prior in history:
+                    try:
+                        prior.close()
+                    except Exception:
+                        pass
+                return None
+
+            next_headers = dict(current_headers)
+            if self._origin(current_url) != self._origin(next_url):
+                for name in list(next_headers):
+                    if name.lower() in {
+                        "authorization", "cookie", "proxy-authorization", "host"
+                    }:
+                        next_headers.pop(name, None)
+
+            # Redirect bodies are irrelevant to scanning and can otherwise
+            # pin a pooled connection indefinitely because dispatch is
+            # streamed. Close each hop before moving on.
+            response.close()
+            history.append(response)
+            current_url = next_url
+            current_headers = next_headers
+            if status == 303 or (status in (301, 302) and current_method not in ("GET", "HEAD")):
+                current_method = "GET"
+                current_data = None
+                current_files = None
+                for name in list(current_headers):
+                    if name.lower() in {"content-length", "content-type", "transfer-encoding"}:
+                        current_headers.pop(name, None)
+            elif current_method == "GET":
+                # Location owns the redirected query string.
+                current_data = None
+
+            if self._rate_limiter is not None:
+                self._rate_limiter.enforce_rate_limit()
+
+        return None
 
     def _read_bounded_response(self, response):
         """Consume at most ``max_response_bytes`` from a streamed response.
@@ -868,10 +980,6 @@ class Requester:
         if not self.session:
             return None
 
-        cache_key, cached = self._check_cache(url, method, data, files)
-        if cached is not None:
-            return cached
-
         # Honour the engine-wide rate limit on EVERY request.  Cached
         # responses are exempt above (they don't hit the network).
         # Previously this was only called from the scan main loop, so
@@ -888,27 +996,22 @@ class Requester:
         self._apply_request_delay()
         url, data, req_headers = self._prepare_request_data(url, data, headers)
 
+        cache_key, cached = self._check_cache(
+            url, method, data, files, headers=req_headers
+        )
+        if cached is not None:
+            return cached
+
         req_start = time.time()
         try:
-            response = self._dispatch_request(url, method, data, req_headers, files, timeout, allow_redirects)
-
-            # SECURITY (SEC-005): validate every redirect hop AFTER the
-            # exchange.  A malicious in-scope target must not be able to
-            # bounce the scanner into private/metadata/out-of-scope hosts
-            # via 3xx chains.
-            if self._net_policy is not None:
-                redirect_chain = [getattr(h, "url", "") for h in getattr(response, "history", []) or []]
-                redirect_chain.append(getattr(response, "url", "") or url)
-                for hop in redirect_chain:
-                    if hop and not self._policy_allows(hop):
-                        try:
-                            response.close()
-                        except Exception:
-                            pass
-                        self.metrics.record_request(
-                            success=False, response_time=time.time() - req_start
-                        )
-                        return None
+            response = self._dispatch_with_validated_redirects(
+                url, method, data, req_headers, files, timeout, allow_redirects
+            )
+            if response is None:
+                self.metrics.record_request(
+                    success=False, response_time=time.time() - req_start
+                )
+                return None
 
             response = self._read_bounded_response(response)
 

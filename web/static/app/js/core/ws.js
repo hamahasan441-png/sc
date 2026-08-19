@@ -11,6 +11,7 @@
  * never poll unless the socket is down.
  */
 import { bus } from "./bus.js";
+import { getAccessToken } from "./api.js";
 
 const FORWARD = [
   "active_scans",
@@ -36,6 +37,7 @@ export function initWs() {
   }
 
   socket = window.io("", {
+    auth: { token: getAccessToken() },
     transports: ["websocket", "polling"],
     reconnection: true,
     reconnectionAttempts: Infinity,

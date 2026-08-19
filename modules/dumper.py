@@ -22,7 +22,9 @@ class DataDumper:
         os.makedirs(self.dump_dir, exist_ok=True)
 
     def run(self, findings: list):
-        """Attempt to dump data based on findings"""
+        """Attempt to dump data based on findings."""
+        from core.authorization import require_authorized
+        require_authorized("data-dump", target=getattr(self.engine, "target", None))
         print(f"{Colors.info('Attempting data extraction...')}")
 
         for finding in findings:

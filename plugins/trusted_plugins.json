@@ -1,0 +1,7 @@
+{
+  "plugins": {
+    "example_logger": "a2e7c1e0d81b923d83408aa6f1d93fe4554c827303cd26da02de61ec66ce66f7",
+    "subdomain_takeover": "73a5464a81ccaa2429ca7a157fc0f8ed8095e10748d7b4ed1714165b5582fc8a"
+  },
+  "version": 1
+}
