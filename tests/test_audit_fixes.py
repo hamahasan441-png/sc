@@ -311,8 +311,11 @@ class TestDetectUpdateTarget(unittest.TestCase):
         if result is None:
             self.skipTest("not a git checkout in this environment")
         self.assertEqual(result[0], "hamahasan441-png/sc")
-        # Branch name varies per session (arena/<id>-sc), so accept any arena/*
-        self.assertTrue(result[1].startswith("arena/"), f"Expected arena/* branch, got {result[1]}")
+        # Branch name varies per session/tooling (e.g. arena/<id>-sc,
+        # claude/<slug>, or a PR branch), so only assert a real branch was
+        # detected rather than pinning a specific naming convention.
+        self.assertIsInstance(result[1], str)
+        self.assertTrue(result[1], f"Expected a non-empty branch name, got {result[1]!r}")
 
 
 class TestAtomicWrapperCLIParsing(unittest.TestCase):

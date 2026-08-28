@@ -119,12 +119,11 @@ def next_cron_time(expression: str, after: Optional[datetime] = None) -> float:
         after = datetime.now(timezone.utc)
     cron = parse_cron(expression)
 
-    # Start from the next full minute
+    # Start from the next full minute.  Use epoch arithmetic so hour/day/month
+    # rollovers are handled correctly (a naive .replace(hour=hour+1) raises
+    # ValueError at 23:59 and never rolls the date over).
     candidate = after.replace(second=0, microsecond=0)
-    candidate = candidate.replace(
-        minute=candidate.minute + 1 if candidate.minute < 59 else 0,
-        hour=candidate.hour + (1 if candidate.minute >= 59 else 0),
-    )
+    candidate = datetime.fromtimestamp(candidate.timestamp() + 60, tz=timezone.utc)
 
     # Brute-force scan (efficient for typical cron patterns)
     max_iterations = 366 * 24 * 60  # one year of minutes

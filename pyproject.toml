@@ -45,6 +45,13 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["core*", "modules*", "utils*", "web*"]
 
+[tool.pytest.ini_options]
+# Registered markers keep `--strict-markers` clean and stop the
+# "Unknown pytest.mark.integration" warning spam during collection.
+markers = [
+    "integration: end-to-end tests that spin up a live server and exercise the full scan pipeline",
+]
+
 [tool.bandit]
 # ATOMIC is an *offensive* security tool. By design it embeds attack
 # payloads (eval/exec/SQL strings), shells out to external recon tools
