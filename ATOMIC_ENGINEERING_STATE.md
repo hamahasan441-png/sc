@@ -99,6 +99,32 @@ spots and what to do about them:
 - Pure planning: it recommends safe validations; it executes nothing and never
   escalates to exploitation. Tests: `tests/test_coverage_planner.py` (12).
 
+### Coverage-closure driver — auto-run loop (this session)
+
+`core/coverage_driver.py`'s `CoverageClosureDriver` works through the planner's
+recommendations until gaps close: plan → run the next safe validation → record
+the outcome → replan. Its safety envelope is enforced in the driver, not left
+to callers:
+
+- **Injected executor** — the driver does no network I/O; the caller supplies
+  `executor(url, validator, method) -> outcome`. Keeps the loop testable and
+  request behavior out of the control plane.
+- **Opt-in allowlist** — only `auto_validators` the caller authorizes ever run
+  (default: nothing).
+- **Hard invasive denylist** — `INVASIVE_VALIDATORS` (gatebreaker, brute_force,
+  dumper, uploader, network_exploits, race_condition, deserialization, cmdi,
+  firewall_bypass, tech_exploits) is **never** auto-run even if allowlisted;
+  such tasks are reported as `skipped_invasive` for deliberate, authorized
+  handling.
+- **Guaranteed termination** — each (endpoint, validator) pair is attempted at
+  most once, bounded by `budget` and `max_iterations`.
+
+Verified end-to-end: safe validators reach 100% endpoint coverage while `cmdi`
+is refused on every endpoint and surfaced for manual handling. Tests:
+`tests/test_coverage_driver.py` (10). This is the auto-run loop referenced as
+the safe next step after the planner — it automates *non-invasive* validation
+only; exploitation stays behind the authorization gate.
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive
