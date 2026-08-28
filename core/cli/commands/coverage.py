@@ -98,6 +98,47 @@ def run_auto_close(engine, budget: int = 100) -> dict:
     return report
 
 
+def build_current_report(engine) -> dict:
+    """Assemble a report-shaped dict for the current scan (for diffing)."""
+    findings = []
+    try:
+        for cf in engine.get_canonical_findings():
+            findings.append(cf.to_dict() if hasattr(cf, "to_dict") else cf)
+    except Exception:
+        findings = []
+    pic = collect_coverage(engine)
+    return {
+        "scan_id": getattr(engine, "scan_id", ""),
+        "target": getattr(engine, "target", ""),
+        "findings": findings,
+        "coverage": pic.get("coverage"),
+        "surface_coverage": pic.get("surface_coverage"),
+    }
+
+
+def run_regression(engine, baseline_path: str, out_path: str = None) -> None:
+    """Diff the current scan against a baseline report and print the result."""
+    from core.regression import diff_reports, format_diff
+
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as fh:
+            baseline = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"{Colors.error(f'Could not read baseline report: {exc}')}", file=sys.stderr)
+        return
+
+    diff = diff_reports(baseline, build_current_report(engine))
+    print(f"\n  {Colors.BOLD}Remediation Retest{Colors.RESET}")
+    print("    " + format_diff(diff).replace("\n", "\n    "))
+    if out_path:
+        try:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(diff, fh, indent=2, sort_keys=True)
+            print(f"{Colors.info(f'Regression diff written to {out_path}')}")
+        except OSError as exc:
+            print(f"{Colors.error(f'Could not write diff JSON: {exc}')}", file=sys.stderr)
+
+
 def apply_post_scan_coverage(engine, config) -> None:
     """Run the coverage hooks selected on the CLI, in order."""
     if config.get("auto_close"):
@@ -112,3 +153,8 @@ def apply_post_scan_coverage(engine, config) -> None:
             print(f"{Colors.error(f'Coverage report failed: {exc}')}", file=sys.stderr)
     if config.get("coverage_json"):
         write_coverage_json(engine, config["coverage_json"])
+    if config.get("diff_baseline"):
+        try:
+            run_regression(engine, config["diff_baseline"], config.get("diff_json"))
+        except Exception as exc:
+            print(f"{Colors.error(f'Regression diff failed: {exc}')}", file=sys.stderr)

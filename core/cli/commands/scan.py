@@ -192,6 +192,8 @@ def _build_config_from_args(args):
         "coverage_json": getattr(args, "coverage_json", None),
         "auto_close": getattr(args, "auto_close", False),
         "coverage_budget": getattr(args, "coverage_budget", 100),
+        "diff_baseline": getattr(args, "diff_baseline", None),
+        "diff_json": getattr(args, "diff_json", None),
     }
 
     return config

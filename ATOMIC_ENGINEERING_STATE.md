@@ -167,6 +167,24 @@ fixtures:
 - The scan JSON report now emits `coverage`, `surface_coverage`,
   `coverage_plan`, and `authz` — the full accounting for an actual run.
 
+### Regression / remediation-retest engine (this session)
+
+`core/regression.py` compares two scan reports of the same target over time —
+the roadmap's REGRESSION COMPARISON / REMEDIATION RETEST:
+
+- `diff_reports(baseline, current)` classifies findings **NEW / FIXED /
+  PERSISTING / CHANGED** (severity or confidence moved) and reports a coverage
+  delta (endpoint coverage %, surface blind spots opened/closed).
+- Findings match by a **stable identity** — the report's `finding_id`, or the
+  same SHA-256 over `(param, payload, technique, url)` that `CanonicalFinding`
+  uses (verified equal in tests) — so legacy and canonical reports diff
+  consistently and the same issue matches across runs regardless of timestamp.
+- CLI: `--diff-baseline PATH` (post-scan) prints a "Remediation Retest"
+  summary and `--diff-json PATH` writes the diff. Verified end-to-end: SQLi
+  FIXED, XSS NEW, IDOR PERSISTING, coverage 100%→66.7%.
+- Pure and deterministic (two report dicts in, one diff out; no I/O). Tests:
+  `tests/test_regression.py` (14) + CLI tests.
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive

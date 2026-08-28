@@ -92,5 +92,46 @@ class TestAutoClose(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "")
 
 
+class TestRegressionHook(unittest.TestCase):
+    def _engine_with_finding(self, technique="idor"):
+        from core.models import CanonicalFinding
+        eng = _engine(modules={technique: True})
+        _with_surface(eng)
+        f = CanonicalFinding(technique=technique, url="https://demo.test/orders/1",
+                             method="GET", param="id")
+        eng._canonical_findings[f.finding_id] = f
+        return eng
+
+    def test_build_current_report_shape(self):
+        from core.cli.commands.coverage import build_current_report
+        rep = build_current_report(self._engine_with_finding())
+        self.assertIn("findings", rep)
+        self.assertIn("coverage", rep)
+        self.assertTrue(any(f.get("finding_id") for f in rep["findings"]))
+
+    def test_diff_baseline_reports_fixed(self):
+        import json as _json
+        import os
+        import tempfile
+        from core.cli.commands.coverage import build_current_report, apply_post_scan_coverage
+        # baseline had a finding; current engine has none -> FIXED
+        base_eng = self._engine_with_finding()
+        baseline = build_current_report(base_eng)
+        clean_eng = _engine(modules={"idor": True})
+        _with_surface(clean_eng)
+        clean_eng._canonical_findings.clear()
+        with tempfile.TemporaryDirectory() as d:
+            bpath = os.path.join(d, "baseline.json")
+            _json.dump(baseline, open(bpath, "w"))
+            outp = os.path.join(d, "diff.json")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                apply_post_scan_coverage(clean_eng, {"diff_baseline": bpath, "diff_json": outp})
+            self.assertTrue(os.path.exists(outp))
+            diff = _json.load(open(outp))
+            self.assertGreaterEqual(diff["summary"]["fixed"], 1)
+            self.assertIn("Remediation Retest", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
