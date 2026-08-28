@@ -125,6 +125,29 @@ is refused on every endpoint and surfaced for manual handling. Tests:
 the safe next step after the planner — it automates *non-invasive* validation
 only; exploitation stays behind the authorization gate.
 
+### Real validator executor — network-touching closure (this session)
+
+`core/coverage_executor.py` gives the closure driver a *real* executor:
+`RealValidatorExecutor` runs an actual scan module against one endpoint and
+maps the result to a coverage outcome (VALIDATED if a new finding appears,
+TESTED if it ran clean, BLOCKED on a raised error, UNSUPPORTED if the module
+isn't loaded, SKIPPED if refused). `AtomicEngine.run_coverage_closure()` is the
+opt-in entry point; `run_coverage_closure(engine, ...)` the free function.
+
+Defense in depth (in addition to the driver's own gates):
+- invasive validators are refused here too (return SKIPPED, module never
+  invoked);
+- an out-of-scope URL returns SKIPPED without touching the network (respects
+  `ScopePolicy`);
+- a module that raises yields BLOCKED — no exception escapes the loop.
+
+Verified end-to-end with the real `cors` + `sqli` modules: out-of-scope →
+SKIPPED; in-scope against a closed port → both ran, handled the connection
+failure gracefully (TESTED, no crash), coverage closed to 100%. This is an
+explicit, opt-in active operation — never part of the default scan flow — and
+it drives NON-INVASIVE validation only. Tests:
+`tests/test_coverage_executor.py` (9, fake modules, no network).
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive

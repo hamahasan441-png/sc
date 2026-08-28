@@ -2024,6 +2024,25 @@ class AtomicEngine:
         cov = build_coverage(self.surface, findings, validators=validators or None)
         return plan_coverage_gaps(cov, self.get_surface_ledger(), validators or None)
 
+    def run_coverage_closure(self, auto_validators=None, budget=100, max_iterations=25):
+        """Actively drive real non-invasive validation to coverage closure.
+
+        Runs the enabled, non-invasive validator modules against the discovered
+        surface until gaps close or the budget is spent, then returns the
+        driver's run report. Invasive/exploitative validators are never
+        auto-run (they are reported as ``skipped_invasive``); exploitation
+        stays behind the authorization gate.
+
+        This performs real requests and is an explicit, opt-in operation — it
+        is NOT part of the default scan flow.
+        """
+        from core.coverage_executor import run_coverage_closure
+
+        return run_coverage_closure(
+            self, auto_validators=auto_validators,
+            budget=budget, max_iterations=max_iterations,
+        )
+
     def _print_attack_results(self):
         """Display rich attack/exploitation results in the console."""
         if not self.post_exploit_results:
