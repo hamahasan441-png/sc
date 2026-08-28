@@ -78,6 +78,27 @@ The accounting above is no longer just unit fixtures — a real run emits it:
   finding lands under AUTHORIZATION (`TESTED_ISSUES` + finding id), untouched
   surfaces list as blind spots. Tests: `tests/test_surface_map.py` (12).
 
+### Coverage-closure planner — "leave no blind spot" (this session)
+
+Realizes the request that, given a target, the framework knows its own blind
+spots and what to do about them:
+
+- `core/coverage_planner.py`'s `plan_coverage_gaps()` combines the
+  per-endpoint coverage grid with the per-category surface ledger to compute
+  (a) **endpoint gaps** — per endpoint, which applicable validators have not
+  reached TESTED; (b) **surface blind spots** — categories still NOT_TESTED,
+  each with the modules that would cover it; and (c) a **prioritized
+  recommended-task list** (whole untested surfaces first, then per-endpoint
+  validator gaps).
+- `CoverageEngine.endpoints()` / `.tested_validators()` expose the data the
+  planner needs; `AtomicEngine.get_coverage_plan()` assembles it read-only.
+- The JSON report now carries a `coverage_plan` block. Verified end-to-end:
+  for a 2-endpoint target with one SQLi finding, the plan correctly reports
+  `/profile` missing all validators, `/search` missing idor+xss, 13 surface
+  blind spots, and concrete module recommendations.
+- Pure planning: it recommends safe validations; it executes nothing and never
+  escalates to exploitation. Tests: `tests/test_coverage_planner.py` (12).
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive

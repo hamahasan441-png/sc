@@ -2003,6 +2003,27 @@ class AtomicEngine:
         ]
         return build_surface_ledger(enabled, self.get_canonical_findings())
 
+    def get_coverage_plan(self):
+        """Compute a coverage-closure plan for this scan ("leave no blind spot").
+
+        Combines the per-endpoint coverage grid with the per-category surface
+        ledger to list what has not been tested and a prioritized set of
+        recommended safe validations. Returns ``None`` if there is nothing to
+        plan over. Read-only; recommends but never executes.
+        """
+        from core.coverage import build_coverage
+        from core.coverage_planner import plan_coverage_gaps
+
+        findings = self.get_canonical_findings()
+        if self.surface is None and not findings:
+            return None
+        validators = [
+            name for name, on in (self.config.get("modules", {}) or {}).items()
+            if on is True
+        ]
+        cov = build_coverage(self.surface, findings, validators=validators or None)
+        return plan_coverage_gaps(cov, self.get_surface_ledger(), validators or None)
+
     def _print_attack_results(self):
         """Display rich attack/exploitation results in the console."""
         if not self.post_exploit_results:

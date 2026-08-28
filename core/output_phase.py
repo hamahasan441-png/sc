@@ -190,6 +190,11 @@ class OutputPhase:
             surface_coverage = self.engine.get_surface_ledger().to_dict()
         except Exception:
             surface_coverage = None
+        coverage_plan = None
+        try:
+            coverage_plan = self.engine.get_coverage_plan()
+        except Exception:
+            coverage_plan = None
 
         generator = ReportGenerator(
             scan_id=self.engine.scan_id,
@@ -205,6 +210,7 @@ class OutputPhase:
             agent_result=agent_result,
             coverage=coverage,
             surface_coverage=surface_coverage,
+            coverage_plan=coverage_plan,
         )
         # Attach finding groups so reporters that know about them can
         # render the cluster section. Reporters that ignore the attribute

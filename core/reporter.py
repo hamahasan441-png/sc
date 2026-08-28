@@ -35,6 +35,7 @@ class ReportGenerator:
         agent_result=None,
         coverage=None,
         surface_coverage=None,
+        coverage_plan=None,
     ):
         # Sanitize scan_id to prevent path traversal in report filenames
         if not self._SAFE_ID.match(scan_id or ""):
@@ -59,6 +60,8 @@ class ReportGenerator:
         # None so existing callers are unaffected.
         self.coverage = coverage
         self.surface_coverage = surface_coverage
+        # Coverage-closure plan (what remains untested + recommended safe tests)
+        self.coverage_plan = coverage_plan
         # Finding groups (correlated clusters). Optional — empty by
         # default; OutputPhase populates this attribute after running
         # the deterministic correlator.
@@ -319,6 +322,7 @@ class ReportGenerator:
             "agent_reasoning_log": self._agent_reasoning_log(),
             "coverage": self.coverage,
             "surface_coverage": self.surface_coverage,
+            "coverage_plan": self.coverage_plan,
         }
 
         try:
