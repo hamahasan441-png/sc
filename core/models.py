@@ -554,6 +554,108 @@ class CoverageSummary:
 
 
 # ---------------------------------------------------------------------------
+# Attack-surface taxonomy + surface-category coverage ledger
+# ---------------------------------------------------------------------------
+
+
+class SurfaceCategory:
+    """The major attack-surface classes a complete assessment must account for.
+
+    The point of enumerating these is to make blind spots explicit: a
+    category left at ``NOT_TESTED`` shows up in the report rather than being
+    silently omitted.
+    """
+
+    NETWORK = "NETWORK"
+    WEB_APP = "WEB_APP"
+    API = "API"
+    AUTHENTICATION = "AUTHENTICATION"
+    AUTHORIZATION = "AUTHORIZATION"
+    INPUT_PROCESSING = "INPUT_PROCESSING"
+    FILE_HANDLING = "FILE_HANDLING"
+    CLIENT_SIDE = "CLIENT_SIDE"
+    BUSINESS_LOGIC = "BUSINESS_LOGIC"
+    HTTP_EDGE = "HTTP_EDGE"
+    DNS_DOMAIN = "DNS_DOMAIN"
+    TLS_CRYPTO = "TLS_CRYPTO"
+    CLOUD_PLATFORM = "CLOUD_PLATFORM"
+    SECRETS = "SECRETS"
+    SECURITY_CONTROLS = "SECURITY_CONTROLS"
+    TECH_VERSION = "TECH_VERSION"
+
+    ALL = (
+        NETWORK, WEB_APP, API, AUTHENTICATION, AUTHORIZATION, INPUT_PROCESSING,
+        FILE_HANDLING, CLIENT_SIDE, BUSINESS_LOGIC, HTTP_EDGE, DNS_DOMAIN,
+        TLS_CRYPTO, CLOUD_PLATFORM, SECRETS, SECURITY_CONTROLS, TECH_VERSION,
+    )
+
+
+class SurfaceCoverageStatus:
+    """The outcome of assessing a surface category.
+
+    Deliberately distinguishes the four states the roadmap insists must never
+    be collapsed: NOT_TESTED vs TESTED_NO_ISSUE vs INCONCLUSIVE vs (issues).
+    """
+
+    NOT_TESTED = "NOT_TESTED"
+    TESTED_NO_ISSUE = "TESTED_NO_ISSUE"
+    TESTED_ISSUES = "TESTED_ISSUES"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    SKIPPED = "SKIPPED"          # deliberately out of scope / budget
+    BLOCKED = "BLOCKED"          # could not test (auth/WAF/network)
+    UNSUPPORTED = "UNSUPPORTED"  # no validator available for this category
+
+    ALL = (
+        NOT_TESTED, TESTED_NO_ISSUE, TESTED_ISSUES, INCONCLUSIVE,
+        SKIPPED, BLOCKED, UNSUPPORTED,
+    )
+
+
+@dataclass
+class SurfaceLedgerEntry:
+    """Coverage record for one attack-surface category."""
+
+    category: str = ""
+    status: str = SurfaceCoverageStatus.NOT_TESTED
+    tested_count: int = 0          # discrete checks executed
+    issue_count: int = 0           # findings attributed to this category
+    reason: str = ""               # why SKIPPED/BLOCKED/INCONCLUSIVE
+    evidence_refs: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "category": self.category,
+            "evidence_refs": sorted(self.evidence_refs),
+            "issue_count": self.issue_count,
+            "reason": self.reason,
+            "status": self.status,
+            "tested_count": self.tested_count,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Finding lifecycle state
+# ---------------------------------------------------------------------------
+
+
+class FindingState:
+    """Evidence-driven lifecycle for a finding.
+
+    CRITICAL/HIGH findings may only reach ``CONFIRMED`` with two independent
+    forms of evidence (see :func:`core.finding_state.derive_finding_state`);
+    this is a deliberate false-positive brake on the highest-impact claims.
+    """
+
+    SUSPECTED = "SUSPECTED"                    # hypothesis, no evidence yet
+    OBSERVED = "OBSERVED"                      # a raw signal seen, not validated
+    VALIDATED = "VALIDATED"                    # reproduced/validated
+    CONFIRMED = "CONFIRMED"                    # validated + sufficient independent evidence
+    REJECTED_FALSE_POSITIVE = "REJECTED_FALSE_POSITIVE"
+
+    ALL = (SUSPECTED, OBSERVED, VALIDATED, CONFIRMED, REJECTED_FALSE_POSITIVE)
+
+
+# ---------------------------------------------------------------------------
 # ScanResult
 # ---------------------------------------------------------------------------
 

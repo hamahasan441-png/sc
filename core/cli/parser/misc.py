@@ -67,6 +67,12 @@ def add_misc_arguments(parser: argparse.ArgumentParser):
     g_bench.add_argument("--calibrate-json", metavar="PATH", help="Write the calibration report as JSON to PATH")
     g_bench.add_argument("--calibrate-bins", type=int, default=10, help="Number of confidence bins for --calibrate (default: 10)")
 
+    g_cov = parser.add_argument_group("Coverage")
+    g_cov.add_argument("--coverage-report", action="store_true", help="After the scan, print the attack-surface coverage summary (what was tested / not tested / remaining gaps)")
+    g_cov.add_argument("--coverage-json", metavar="PATH", help="Write the full coverage picture (coverage + surface_coverage + coverage_plan) as JSON to PATH")
+    g_cov.add_argument("--auto-close", action="store_true", help="After the scan, auto-run the remaining NON-INVASIVE validations to close coverage gaps (exploitation stays gated)")
+    g_cov.add_argument("--coverage-budget", type=int, default=100, help="Max validations to run during --auto-close (default: 100)")
+
     g8 = parser.add_argument_group("Security Testing Profiles")
     g8.add_argument("--quick", action="store_true", help="Quick scan profile (fast, limited depth)")
     g8.add_argument("--standard", action="store_true", help="Standard scan profile (balanced)")

@@ -33,6 +33,10 @@ class ReportGenerator:
         shield_profile=None,
         origin_result=None,
         agent_result=None,
+        coverage=None,
+        surface_coverage=None,
+        coverage_plan=None,
+        authz=None,
     ):
         # Sanitize scan_id to prevent path traversal in report filenames
         if not self._SAFE_ID.match(scan_id or ""):
@@ -51,6 +55,16 @@ class ReportGenerator:
         self.shield_profile = shield_profile or {}
         self.origin_result = origin_result or {}
         self.agent_result = agent_result or {}
+        # Coverage accounting (optional). ``coverage`` is a CoverageSummary
+        # dict (per-endpoint/validator); ``surface_coverage`` is a
+        # SurfaceLedger dict (per attack-surface category). Both default to
+        # None so existing callers are unaffected.
+        self.coverage = coverage
+        self.surface_coverage = surface_coverage
+        # Coverage-closure plan (what remains untested + recommended safe tests)
+        self.coverage_plan = coverage_plan
+        # Authorization matrix (expected vs. observed access) from authz findings
+        self.authz = authz
         # Finding groups (correlated clusters). Optional — empty by
         # default; OutputPhase populates this attribute after running
         # the deterministic correlator.
@@ -309,6 +323,10 @@ class ReportGenerator:
             "origin_exposure_note": self._origin_exposure_info(),
             "remediation_plan": self._remediation_plan(),
             "agent_reasoning_log": self._agent_reasoning_log(),
+            "coverage": self.coverage,
+            "surface_coverage": self.surface_coverage,
+            "coverage_plan": self.coverage_plan,
+            "authz": self.authz,
         }
 
         try:

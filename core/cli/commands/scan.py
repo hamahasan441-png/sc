@@ -187,6 +187,11 @@ def _build_config_from_args(args):
         "format": getattr(args, "format", "html"),
         "authorized": getattr(args, "authorized", False),
         "unsafe_mode": getattr(args, "unsafe_mode", False),
+        # Coverage hooks
+        "coverage_report": getattr(args, "coverage_report", False),
+        "coverage_json": getattr(args, "coverage_json", None),
+        "auto_close": getattr(args, "auto_close", False),
+        "coverage_budget": getattr(args, "coverage_budget", 100),
     }
 
     return config
@@ -326,6 +331,15 @@ def handle_scan(args):
                     if config.get("verbose"):
                         print(f"{Colors.warning(f'LLM setup failed: {exc}')}")
             engine.scan(target)
+            # Coverage hooks (auto-close / report / json) run against the
+            # scanned engine before reports so the report reflects any
+            # closure work. Non-invasive only; exploitation stays gated.
+            try:
+                from core.cli.commands.coverage import apply_post_scan_coverage
+                apply_post_scan_coverage(engine, config)
+            except Exception as exc:
+                if config.get("verbose"):
+                    print(f"{Colors.warning(f'Coverage hooks failed: {exc}')}")
             engine.generate_reports()
         except KeyboardInterrupt:
             print(f"\n{Colors.warning('Scan interrupted by user')}")

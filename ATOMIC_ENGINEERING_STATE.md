@@ -28,6 +28,156 @@ test-suite instability. The suite is now reliably green (0 failures).
 Also fixed the sandbox environment (missing `_cffi_backend`, flask, bs4, etc.)
 — see `ATOMIC_BASELINE.md` → "Environment setup".
 
+## Attack-surface coverage slice (this session)
+
+Realizes the safe core of the "complete attack-surface coverage" spec —
+assurance that no major surface is silently skipped, and a false-positive
+brake on the highest-impact claims:
+
+- **Surface coverage ledger** (`core/surface_ledger.py` + `SurfaceCategory`,
+  `SurfaceCoverageStatus`, `SurfaceLedgerEntry` in `core/models.py`). Tracks
+  each of 16 attack-surface classes (network, web, API, auth, authz, input,
+  file-handling, client-side, business-logic, HTTP-edge, DNS, TLS, cloud,
+  secrets, security-controls, tech/version). Every category starts
+  `NOT_TESTED`, so a surface no module exercised is reported as an explicit
+  blind spot; the report can distinguish `NOT_TESTED` / `TESTED_NO_ISSUE` /
+  `INCONCLUSIVE` / `TESTED_ISSUES` / `SKIPPED` / `BLOCKED` with reasons.
+- **Finding-state model** (`core/finding_state.py` + `FindingState` in
+  `core/models.py`). Derives SUSPECTED → OBSERVED → VALIDATED → CONFIRMED (or
+  REJECTED) from evidence, enforcing the rule that **CRITICAL/HIGH findings
+  require two independent evidence forms to reach CONFIRMED** — a single
+  detection method caps them at VALIDATED.
+- Tests: `tests/test_surface_ledger.py` (14) + `tests/test_finding_state.py`
+  (11).
+- **Authorization matrix** (`core/authz_matrix.py`). Implements the spec's
+  `SUBJECT → ROLE → RESOURCE → ACTION → EXPECTED → OBSERVED` grid. Flags every
+  mismatch and classifies the security-critical direction (expected DENY,
+  observed ALLOW) as **horizontal** (accessed another subject's object —
+  IDOR/BOLA/tenant-isolation) or **vertical** (privilege escalation, when role
+  ranks are supplied); untested cells are first-class coverage gaps.
+  Fail-closed: an observation with no prior expectation defaults to expected
+  DENY so an unexpected ALLOW surfaces. Pure accounting — records outcomes the
+  caller supplies, performs no requests, never bypasses the authorization
+  gate. 16 tests in `tests/test_authz_matrix.py`.
+
+### Wired into the live scan + report (this session)
+
+The accounting above is no longer just unit fixtures — a real run emits it:
+
+- `core/surface_map.py` maps every scan module / finding technique to its
+  primary attack-surface category (unmapped names stay `None`, so coverage is
+  never over-claimed).
+- `AtomicEngine.get_surface_ledger()` builds a per-run `SurfaceLedger` from the
+  enabled modules (tested) and canonical findings (issues), read-only.
+- `core/output_phase.py` populates `coverage` (per-endpoint) and
+  `surface_coverage` (per-category) best-effort and passes them to the
+  reporter; a coverage error can never abort report generation.
+- `core/reporter.py`'s JSON report now carries `coverage` and
+  `surface_coverage` blocks, so the report answers "what was tested / not
+  tested / had issues" for an actual scan. Verified end-to-end: an IDOR
+  finding lands under AUTHORIZATION (`TESTED_ISSUES` + finding id), untouched
+  surfaces list as blind spots. Tests: `tests/test_surface_map.py` (12).
+
+### Coverage-closure planner — "leave no blind spot" (this session)
+
+Realizes the request that, given a target, the framework knows its own blind
+spots and what to do about them:
+
+- `core/coverage_planner.py`'s `plan_coverage_gaps()` combines the
+  per-endpoint coverage grid with the per-category surface ledger to compute
+  (a) **endpoint gaps** — per endpoint, which applicable validators have not
+  reached TESTED; (b) **surface blind spots** — categories still NOT_TESTED,
+  each with the modules that would cover it; and (c) a **prioritized
+  recommended-task list** (whole untested surfaces first, then per-endpoint
+  validator gaps).
+- `CoverageEngine.endpoints()` / `.tested_validators()` expose the data the
+  planner needs; `AtomicEngine.get_coverage_plan()` assembles it read-only.
+- The JSON report now carries a `coverage_plan` block. Verified end-to-end:
+  for a 2-endpoint target with one SQLi finding, the plan correctly reports
+  `/profile` missing all validators, `/search` missing idor+xss, 13 surface
+  blind spots, and concrete module recommendations.
+- Pure planning: it recommends safe validations; it executes nothing and never
+  escalates to exploitation. Tests: `tests/test_coverage_planner.py` (12).
+
+### Coverage-closure driver — auto-run loop (this session)
+
+`core/coverage_driver.py`'s `CoverageClosureDriver` works through the planner's
+recommendations until gaps close: plan → run the next safe validation → record
+the outcome → replan. Its safety envelope is enforced in the driver, not left
+to callers:
+
+- **Injected executor** — the driver does no network I/O; the caller supplies
+  `executor(url, validator, method) -> outcome`. Keeps the loop testable and
+  request behavior out of the control plane.
+- **Opt-in allowlist** — only `auto_validators` the caller authorizes ever run
+  (default: nothing).
+- **Hard invasive denylist** — `INVASIVE_VALIDATORS` (gatebreaker, brute_force,
+  dumper, uploader, network_exploits, race_condition, deserialization, cmdi,
+  firewall_bypass, tech_exploits) is **never** auto-run even if allowlisted;
+  such tasks are reported as `skipped_invasive` for deliberate, authorized
+  handling.
+- **Guaranteed termination** — each (endpoint, validator) pair is attempted at
+  most once, bounded by `budget` and `max_iterations`.
+
+Verified end-to-end: safe validators reach 100% endpoint coverage while `cmdi`
+is refused on every endpoint and surfaced for manual handling. Tests:
+`tests/test_coverage_driver.py` (10). This is the auto-run loop referenced as
+the safe next step after the planner — it automates *non-invasive* validation
+only; exploitation stays behind the authorization gate.
+
+### Real validator executor — network-touching closure (this session)
+
+`core/coverage_executor.py` gives the closure driver a *real* executor:
+`RealValidatorExecutor` runs an actual scan module against one endpoint and
+maps the result to a coverage outcome (VALIDATED if a new finding appears,
+TESTED if it ran clean, BLOCKED on a raised error, UNSUPPORTED if the module
+isn't loaded, SKIPPED if refused). `AtomicEngine.run_coverage_closure()` is the
+opt-in entry point; `run_coverage_closure(engine, ...)` the free function.
+
+Defense in depth (in addition to the driver's own gates):
+- invasive validators are refused here too (return SKIPPED, module never
+  invoked);
+- an out-of-scope URL returns SKIPPED without touching the network (respects
+  `ScopePolicy`);
+- a module that raises yields BLOCKED — no exception escapes the loop.
+
+Verified end-to-end with the real `cors` + `sqli` modules: out-of-scope →
+SKIPPED; in-scope against a closed port → both ran, handled the connection
+failure gracefully (TESTED, no crash), coverage closed to 100%. This is an
+explicit, opt-in active operation — never part of the default scan flow — and
+it drives NON-INVASIVE validation only. Tests:
+`tests/test_coverage_executor.py` (9, fake modules, no network).
+
+### Made real: CLI + report wiring (this session)
+
+The whole coverage system is now reachable from a real run, not just unit
+fixtures:
+
+- **CLI hooks** (`core/cli/commands/coverage.py`, wired into
+  `core/cli/commands/scan.py`): `--coverage-report` prints the post-scan
+  attack-surface coverage summary; `--coverage-json PATH` dumps the full
+  picture; `--auto-close` runs the real non-invasive closure loop after the
+  scan (`--coverage-budget` caps it). Verified with a real `main.py -t ...`
+  run.
+- **Authorization matrix from real findings**
+  (`build_authz_matrix_from_findings` + `AtomicEngine.get_authz_matrix()`):
+  each IDOR/BOLA finding becomes a confirmed horizontal broken-access cell.
+  The JSON report now carries an `authz` block (when non-empty), and the CLI
+  summary prints broken-access counts by kind.
+- The scan JSON report now emits `coverage`, `surface_coverage`,
+  `coverage_plan`, and `authz` — the full accounting for an actual run.
+
+### Safety boundary (declined by design)
+
+The spec also asked that Atomic "escalate from scanning into invasive
+exploitation automatically" against production targets. That was **not
+built.** Exploitation stays behind the repository's existing authorization
+gate (`core/authorization.py`'s `require_authorized()` / `is_authorized()`,
+plus `core/scope.py`'s `ScopePolicy`), which every post-exploit path must
+call before any destructive/exploitative action. Removing that gate to
+auto-attack production is out of bounds; the coverage/confidence work above
+is the defensible part of the request and is what was delivered.
+
 ## Target architecture vs. reality (evidence-mapped)
 
 The master prompt asks for a canonical runtime with ~30 named subsystems.

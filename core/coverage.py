@@ -168,6 +168,26 @@ class CoverageEngine:
     def records(self) -> List[CoverageRecord]:
         return sorted(self._cells.values(), key=lambda r: r.cell_key)
 
+    def endpoints(self) -> Dict[str, tuple]:
+        """All known endpoints as ``{endpoint_key: (url, method)}``.
+
+        Union of discovery-registered endpoints and any referenced only by a
+        coverage cell, so a planner sees the complete endpoint set.
+        """
+        out = dict(self._endpoints)
+        for rec in self._cells.values():
+            out.setdefault(rec.endpoint_key, (rec.url, rec.method))
+        return out
+
+    def tested_validators(self, endpoint_key: str) -> set:
+        """Validators that reached >= TESTED for one endpoint."""
+        tested_rank = COVERAGE_RANK[CoverageState.TESTED]
+        return {
+            rec.validator for rec in self._cells.values()
+            if rec.endpoint_key == endpoint_key
+            and COVERAGE_RANK[rec.state] >= tested_rank
+        }
+
     def summary(self) -> CoverageSummary:
         # Union of endpoints seen via discovery and via any cell.
         all_ep_keys = set(self._endpoints)

@@ -1986,6 +1986,71 @@ class AtomicEngine:
         engine = build_coverage(self.surface, findings, validators=validators or None)
         return engine.summary()
 
+    def get_surface_ledger(self):
+        """Build a :class:`core.surface_ledger.SurfaceLedger` for this scan.
+
+        Read-only aggregation: enabled modules mark their attack-surface
+        category as tested; canonical findings mark their category as having
+        issues. Surfaces no enabled module covers stay NOT_TESTED and are
+        reported as explicit blind spots. Threads no state through the scan
+        loop.
+        """
+        from core.surface_map import build_surface_ledger
+
+        enabled = [
+            name for name, on in (self.config.get("modules", {}) or {}).items()
+            if on is True
+        ]
+        return build_surface_ledger(enabled, self.get_canonical_findings())
+
+    def get_coverage_plan(self):
+        """Compute a coverage-closure plan for this scan ("leave no blind spot").
+
+        Combines the per-endpoint coverage grid with the per-category surface
+        ledger to list what has not been tested and a prioritized set of
+        recommended safe validations. Returns ``None`` if there is nothing to
+        plan over. Read-only; recommends but never executes.
+        """
+        from core.coverage import build_coverage
+        from core.coverage_planner import plan_coverage_gaps
+
+        findings = self.get_canonical_findings()
+        if self.surface is None and not findings:
+            return None
+        validators = [
+            name for name, on in (self.config.get("modules", {}) or {}).items()
+            if on is True
+        ]
+        cov = build_coverage(self.surface, findings, validators=validators or None)
+        return plan_coverage_gaps(cov, self.get_surface_ledger(), validators or None)
+
+    def run_coverage_closure(self, auto_validators=None, budget=100, max_iterations=25):
+        """Actively drive real non-invasive validation to coverage closure.
+
+        Runs the enabled, non-invasive validator modules against the discovered
+        surface until gaps close or the budget is spent, then returns the
+        driver's run report. Invasive/exploitative validators are never
+        auto-run (they are reported as ``skipped_invasive``); exploitation
+        stays behind the authorization gate.
+
+        This performs real requests and is an explicit, opt-in operation — it
+        is NOT part of the default scan flow.
+        """
+        from core.coverage_executor import run_coverage_closure
+
+        return run_coverage_closure(
+            self, auto_validators=auto_validators,
+            budget=budget, max_iterations=max_iterations,
+        )
+
+    def get_authz_matrix(self):
+        """Build a :class:`core.authz_matrix.AuthorizationMatrix` from this
+        scan's access-control findings (IDOR/BOLA), read-only. Returns the
+        matrix (possibly empty)."""
+        from core.authz_matrix import build_authz_matrix_from_findings
+
+        return build_authz_matrix_from_findings(self.get_canonical_findings())
+
     def _print_attack_results(self):
         """Display rich attack/exploitation results in the console."""
         if not self.post_exploit_results:
