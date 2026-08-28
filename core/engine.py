@@ -2043,6 +2043,14 @@ class AtomicEngine:
             budget=budget, max_iterations=max_iterations,
         )
 
+    def get_authz_matrix(self):
+        """Build a :class:`core.authz_matrix.AuthorizationMatrix` from this
+        scan's access-control findings (IDOR/BOLA), read-only. Returns the
+        matrix (possibly empty)."""
+        from core.authz_matrix import build_authz_matrix_from_findings
+
+        return build_authz_matrix_from_findings(self.get_canonical_findings())
+
     def _print_attack_results(self):
         """Display rich attack/exploitation results in the console."""
         if not self.post_exploit_results:

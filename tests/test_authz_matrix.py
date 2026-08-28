@@ -130,5 +130,63 @@ class TestSummary(unittest.TestCase):
         self.assertEqual(keys, sorted(keys))
 
 
+class TestBuildFromFindings(unittest.TestCase):
+    def test_idor_finding_becomes_horizontal_broken_access(self):
+        from core.authz_matrix import build_authz_matrix_from_findings
+        from core.models import CanonicalFinding
+        f = CanonicalFinding(technique="idor", url="https://x/orders/1",
+                             method="GET", param="id")
+        m = build_authz_matrix_from_findings([f])
+        broken = m.broken_access()
+        self.assertEqual(len(broken), 1)
+        self.assertEqual(m.classify(broken[0]), ViolationKind.HORIZONTAL)
+        self.assertIn(f.finding_id, broken[0].note)
+
+    def test_non_authz_findings_ignored(self):
+        from core.authz_matrix import build_authz_matrix_from_findings
+        from core.models import CanonicalFinding
+        f = CanonicalFinding(technique="xss", url="https://x/a", param="q")
+        m = build_authz_matrix_from_findings([f])
+        self.assertEqual(m.summary()["cells_total"], 0)
+
+    def test_dict_findings_supported(self):
+        from core.authz_matrix import build_authz_matrix_from_findings
+        m = build_authz_matrix_from_findings(
+            [{"technique": "idor", "url": "https://x/o/2", "finding_id": "z9"}]
+        )
+        self.assertEqual(m.summary()["broken_access"], 1)
+
+    def test_empty(self):
+        from core.authz_matrix import build_authz_matrix_from_findings
+        self.assertEqual(build_authz_matrix_from_findings([]).summary()["cells_total"], 0)
+
+
+class TestEngineAndReport(unittest.TestCase):
+    def _engine(self):
+        from core.engine import AtomicEngine
+        return AtomicEngine({"quiet": True, "modules": {"idor": True}})
+
+    def test_engine_get_authz_matrix(self):
+        from core.models import CanonicalFinding
+        eng = self._engine()
+        f = CanonicalFinding(technique="idor", url="https://x/o/1", param="id")
+        eng._canonical_findings[f.finding_id] = f
+        self.assertEqual(eng.get_authz_matrix().summary()["broken_access"], 1)
+
+    def test_report_includes_authz_when_present(self):
+        import json, tempfile
+        from core.reporter import ReportGenerator
+        from core.models import CanonicalFinding
+        eng = self._engine()
+        f = CanonicalFinding(technique="idor", url="https://x/o/1", param="id")
+        eng._canonical_findings[f.finding_id] = f
+        with tempfile.TemporaryDirectory() as d:
+            gen = ReportGenerator(scan_id="a1", findings=[], target="https://x",
+                                  output_dir=d, authz=eng.get_authz_matrix().to_dict())
+            data = json.load(open(gen.generate("json")))
+            self.assertIn("authz", data)
+            self.assertEqual(data["authz"]["summary"]["broken_access"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

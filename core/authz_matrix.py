@@ -196,3 +196,33 @@ class AuthorizationMatrix:
             ],
             "summary": self.summary(),
         }
+
+
+# Techniques that, when found, represent a broken authorization boundary.
+# IDOR/BOLA is object-level (horizontal) access control by nature.
+_AUTHZ_TECHNIQUES = {"idor", "bola"}
+
+
+def build_authz_matrix_from_findings(findings, role_ranks=None) -> "AuthorizationMatrix":
+    """Build an :class:`AuthorizationMatrix` from real access-control findings.
+
+    Each IDOR/BOLA finding is recorded as a confirmed broken-access cell: a
+    tester reached a resource owned by another subject, which the matrix
+    classifies as a horizontal violation. Findings of other techniques are
+    ignored. Returns an empty matrix if there are no authz findings.
+    """
+    m = AuthorizationMatrix(role_ranks=role_ranks)
+    for f in findings or []:
+        is_dict = isinstance(f, dict)
+        tech = (f.get("technique", "") if is_dict else getattr(f, "technique", "")) or ""
+        if tech.lower() not in _AUTHZ_TECHNIQUES:
+            continue
+        url = (f.get("url", "") if is_dict else getattr(f, "url", "")) or ""
+        method = (f.get("method", "GET") if is_dict else getattr(f, "method", "GET")) or "GET"
+        fid = (f.get("finding_id", "") if is_dict else getattr(f, "finding_id", "")) or ""
+        # A tester reached an object owned by a different subject.
+        m.add_expectation("tester", "user", url, method.lower(),
+                          AccessOutcome.DENY, owner="resource_owner")
+        m.record_observation("tester", "user", url, method.lower(),
+                             AccessOutcome.ALLOW, note=f"finding {fid}" if fid else "")
+    return m

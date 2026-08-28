@@ -36,6 +36,7 @@ class ReportGenerator:
         coverage=None,
         surface_coverage=None,
         coverage_plan=None,
+        authz=None,
     ):
         # Sanitize scan_id to prevent path traversal in report filenames
         if not self._SAFE_ID.match(scan_id or ""):
@@ -62,6 +63,8 @@ class ReportGenerator:
         self.surface_coverage = surface_coverage
         # Coverage-closure plan (what remains untested + recommended safe tests)
         self.coverage_plan = coverage_plan
+        # Authorization matrix (expected vs. observed access) from authz findings
+        self.authz = authz
         # Finding groups (correlated clusters). Optional — empty by
         # default; OutputPhase populates this attribute after running
         # the deterministic correlator.
@@ -323,6 +326,7 @@ class ReportGenerator:
             "coverage": self.coverage,
             "surface_coverage": self.surface_coverage,
             "coverage_plan": self.coverage_plan,
+            "authz": self.authz,
         }
 
         try:

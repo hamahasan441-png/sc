@@ -27,6 +27,7 @@ def collect_coverage(engine) -> dict:
         ("coverage", "get_coverage_summary"),
         ("surface_coverage", "get_surface_ledger"),
         ("coverage_plan", "get_coverage_plan"),
+        ("authz", "get_authz_matrix"),
     ):
         try:
             obj = getattr(engine, getter)()
@@ -66,6 +67,12 @@ def print_coverage_summary(engine) -> None:
             else:
                 mods = ", ".join(t.get("suggested_modules", [])[:3])
                 print(f"      - assess {t.get('target')} (e.g. {mods})")
+
+    authz = (pic.get("authz") or {}).get("summary", {})
+    if authz.get("broken_access", 0):
+        by = authz.get("violations_by_kind", {})
+        print(f"    {Colors.warning('Authorization')}: {authz['broken_access']} broken-access "
+              f"({', '.join(f'{k}={v}' for k, v in sorted(by.items()))})")
 
 
 def write_coverage_json(engine, path: str) -> None:

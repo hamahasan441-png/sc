@@ -148,6 +148,25 @@ explicit, opt-in active operation — never part of the default scan flow — an
 it drives NON-INVASIVE validation only. Tests:
 `tests/test_coverage_executor.py` (9, fake modules, no network).
 
+### Made real: CLI + report wiring (this session)
+
+The whole coverage system is now reachable from a real run, not just unit
+fixtures:
+
+- **CLI hooks** (`core/cli/commands/coverage.py`, wired into
+  `core/cli/commands/scan.py`): `--coverage-report` prints the post-scan
+  attack-surface coverage summary; `--coverage-json PATH` dumps the full
+  picture; `--auto-close` runs the real non-invasive closure loop after the
+  scan (`--coverage-budget` caps it). Verified with a real `main.py -t ...`
+  run.
+- **Authorization matrix from real findings**
+  (`build_authz_matrix_from_findings` + `AtomicEngine.get_authz_matrix()`):
+  each IDOR/BOLA finding becomes a confirmed horizontal broken-access cell.
+  The JSON report now carries an `authz` block (when non-empty), and the CLI
+  summary prints broken-access counts by kind.
+- The scan JSON report now emits `coverage`, `surface_coverage`,
+  `coverage_plan`, and `authz` — the full accounting for an actual run.
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive

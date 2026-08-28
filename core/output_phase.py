@@ -195,6 +195,15 @@ class OutputPhase:
             coverage_plan = self.engine.get_coverage_plan()
         except Exception:
             coverage_plan = None
+        authz = None
+        try:
+            matrix = self.engine.get_authz_matrix()
+            d = matrix.to_dict()
+            # Only attach when there is something to report.
+            if d.get("summary", {}).get("cells_total", 0) > 0:
+                authz = d
+        except Exception:
+            authz = None
 
         generator = ReportGenerator(
             scan_id=self.engine.scan_id,
@@ -211,6 +220,7 @@ class OutputPhase:
             coverage=coverage,
             surface_coverage=surface_coverage,
             coverage_plan=coverage_plan,
+            authz=authz,
         )
         # Attach finding groups so reporters that know about them can
         # render the cluster section. Reporters that ignore the attribute
