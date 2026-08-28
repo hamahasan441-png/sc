@@ -63,6 +63,9 @@ def add_misc_arguments(parser: argparse.ArgumentParser):
     g_bench.add_argument("--benchmark-json", metavar="PATH", help="Write benchmark results as JSON to PATH")
     g_bench.add_argument("--benchmark-baseline", metavar="PATH", help="Compare benchmark results against a saved baseline JSON; exit non-zero on regression")
     g_bench.add_argument("--benchmark-tolerance", type=float, default=None, help="Regression tolerance fraction for --benchmark-baseline (default: 0.30)")
+    g_bench.add_argument("--calibrate", metavar="PATH", help="Compute confidence-calibration metrics (ECE/MCE/Brier) from a JSON samples file and exit")
+    g_bench.add_argument("--calibrate-json", metavar="PATH", help="Write the calibration report as JSON to PATH")
+    g_bench.add_argument("--calibrate-bins", type=int, default=10, help="Number of confidence bins for --calibrate (default: 10)")
 
     g8 = parser.add_argument_group("Security Testing Profiles")
     g8.add_argument("--quick", action="store_true", help="Quick scan profile (fast, limited depth)")

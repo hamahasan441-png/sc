@@ -92,9 +92,13 @@ Ranked by value ÷ risk. Each is a concrete vertical slice, not a rewrite.
    >tolerance throughput drop) and a `make benchmark` target. 16 tests in
    `tests/test_benchmark.py`.
 
-3. **Confidence calibration harness** *(next up)* — the prompt's "predicted vs.
-   actual confirmation rate" needs deterministic fixtures; `core/scorer.py` +
-   `tests/golden/` are the foundation to build it on.
+3. **Confidence calibration harness** — ✅ **DONE this session.**
+   `core/calibration.py` computes reliability bins, ECE, MCE and Brier score
+   from (predicted confidence, actual outcome) samples; `samples_from_findings`
+   bridges `CanonicalFinding` + a ground-truth map, and `calibrate_by_label`
+   gives per-technique reports. Wired as `--calibrate PATH` /
+   `--calibrate-json` / `--calibrate-bins`. 18 tests in
+   `tests/test_calibration.py` (incl. hand-computed ECE/MCE/Brier).
 4. **Event bus (optional)** — only if the dashboard needs incremental updates;
    today it works without one. Low priority unless real-time UI is a goal.
 5. **Silent-failure audit** — 268 `except: pass` sites repo-wide. Most are
