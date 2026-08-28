@@ -185,6 +185,17 @@ the roadmap's REGRESSION COMPARISON / REMEDIATION RETEST:
 - Pure and deterministic (two report dicts in, one diff out; no I/O). Tests:
   `tests/test_regression.py` (14) + CLI tests.
 
+### Baseline-aware SARIF (this session)
+
+`ReportGenerator.scan_result_to_canonical_sarif(scan_result, baseline=...)`
+stamps SARIF's native `baselineState` on each result — `new` (not in the
+baseline), `updated` (severity/confidence moved), or `unchanged` — matching by
+the stable `finding_id`. This lets CI code-scanning (e.g. GitHub) surface only
+newly-introduced issues. Omitting `baseline` leaves output byte-identical (the
+32 golden SARIF stability tests still pass). CLI: `--diff-sarif PATH` (with
+`--diff-baseline`). Verified: sqli→unchanged, xss→new. Tests:
+`tests/test_sarif_baseline.py` (6).
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive

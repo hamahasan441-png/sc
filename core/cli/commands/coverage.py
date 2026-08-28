@@ -116,7 +116,8 @@ def build_current_report(engine) -> dict:
     }
 
 
-def run_regression(engine, baseline_path: str, out_path: str = None) -> None:
+def run_regression(engine, baseline_path: str, out_path: str = None,
+                   sarif_path: str = None) -> None:
     """Diff the current scan against a baseline report and print the result."""
     from core.regression import diff_reports, format_diff
 
@@ -137,6 +138,27 @@ def run_regression(engine, baseline_path: str, out_path: str = None) -> None:
             print(f"{Colors.info(f'Regression diff written to {out_path}')}")
         except OSError as exc:
             print(f"{Colors.error(f'Could not write diff JSON: {exc}')}", file=sys.stderr)
+    if sarif_path:
+        _write_baseline_sarif(engine, baseline, sarif_path)
+
+
+def _write_baseline_sarif(engine, baseline, sarif_path: str) -> None:
+    """Write SARIF with results stamped new/unchanged/updated vs baseline."""
+    from core.models import ScanResult
+    from core.reporter import ReportGenerator
+
+    sr = ScanResult(
+        scan_id=getattr(engine, "scan_id", ""),
+        target=getattr(engine, "target", ""),
+        findings=list(engine.get_canonical_findings()),
+    )
+    sarif = ReportGenerator.scan_result_to_canonical_sarif(sr, baseline=baseline)
+    try:
+        with open(sarif_path, "w", encoding="utf-8") as fh:
+            json.dump(sarif, fh, indent=2, sort_keys=True)
+        print(f"{Colors.info(f'Baseline-aware SARIF written to {sarif_path}')}")
+    except OSError as exc:
+        print(f"{Colors.error(f'Could not write SARIF: {exc}')}", file=sys.stderr)
 
 
 def apply_post_scan_coverage(engine, config) -> None:
@@ -155,6 +177,7 @@ def apply_post_scan_coverage(engine, config) -> None:
         write_coverage_json(engine, config["coverage_json"])
     if config.get("diff_baseline"):
         try:
-            run_regression(engine, config["diff_baseline"], config.get("diff_json"))
+            run_regression(engine, config["diff_baseline"], config.get("diff_json"),
+                           sarif_path=config.get("diff_sarif"))
         except Exception as exc:
             print(f"{Colors.error(f'Regression diff failed: {exc}')}", file=sys.stderr)

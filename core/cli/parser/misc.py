@@ -74,6 +74,7 @@ def add_misc_arguments(parser: argparse.ArgumentParser):
     g_cov.add_argument("--coverage-budget", type=int, default=100, help="Max validations to run during --auto-close (default: 100)")
     g_cov.add_argument("--diff-baseline", metavar="PATH", help="After the scan, diff findings + coverage against a previous report JSON (NEW/FIXED/PERSISTING/CHANGED) for remediation retest")
     g_cov.add_argument("--diff-json", metavar="PATH", help="Write the regression diff as JSON to PATH")
+    g_cov.add_argument("--diff-sarif", metavar="PATH", help="Write baseline-aware SARIF (results stamped new/unchanged/updated vs --diff-baseline) to PATH for CI code-scanning")
 
     g8 = parser.add_argument_group("Security Testing Profiles")
     g8.add_argument("--quick", action="store_true", help="Quick scan profile (fast, limited depth)")

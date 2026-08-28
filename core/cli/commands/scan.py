@@ -194,6 +194,7 @@ def _build_config_from_args(args):
         "coverage_budget": getattr(args, "coverage_budget", 100),
         "diff_baseline": getattr(args, "diff_baseline", None),
         "diff_json": getattr(args, "diff_json", None),
+        "diff_sarif": getattr(args, "diff_sarif", None),
     }
 
     return config
