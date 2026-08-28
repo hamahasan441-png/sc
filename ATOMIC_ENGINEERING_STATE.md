@@ -196,6 +196,22 @@ newly-introduced issues. Omitting `baseline` leaves output byte-identical (the
 `--diff-baseline`). Verified: sqli→unchanged, xss→new. Tests:
 `tests/test_sarif_baseline.py` (6).
 
+### Differential CI gate (this session)
+
+`core/gate.py`'s `evaluate_gate(diff, ...)` turns a regression diff into a
+pass/fail CI verdict — failing only on what *changed*: new findings at/above a
+severity, or a coverage regression. This is what makes the scanner adoptable in
+a pipeline (a PR is blocked for risk it adds, not the backlog it inherited).
+
+- `--gate-new-severity SEV` fails the build if any NEW finding (vs
+  `--diff-baseline`) is at/above SEV; `--gate-on-coverage-drop`
+  (+`--gate-coverage-tolerance`) fails on a coverage regression;
+  `--gate-junit PATH` writes JUnit XML (one testcase per check, XML-escaped).
+- The gate sets a real non-zero process exit code; verified end-to-end: a NEW
+  CRITICAL → "CI gate: FAIL" → exit 1, while a pre-existing finding passes.
+- Pure & deterministic (diff + policy in, verdict out). Tests:
+  `tests/test_gate.py` (15) + CLI gate tests.
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive

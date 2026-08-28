@@ -195,6 +195,10 @@ def _build_config_from_args(args):
         "diff_baseline": getattr(args, "diff_baseline", None),
         "diff_json": getattr(args, "diff_json", None),
         "diff_sarif": getattr(args, "diff_sarif", None),
+        "gate_new_severity": getattr(args, "gate_new_severity", None),
+        "gate_on_coverage_drop": getattr(args, "gate_on_coverage_drop", False),
+        "gate_coverage_tolerance": getattr(args, "gate_coverage_tolerance", 0.0),
+        "gate_junit": getattr(args, "gate_junit", None),
     }
 
     return config

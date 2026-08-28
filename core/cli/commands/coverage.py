@@ -117,7 +117,7 @@ def build_current_report(engine) -> dict:
 
 
 def run_regression(engine, baseline_path: str, out_path: str = None,
-                   sarif_path: str = None) -> None:
+                   sarif_path: str = None, gate: dict = None) -> None:
     """Diff the current scan against a baseline report and print the result."""
     from core.regression import diff_reports, format_diff
 
@@ -140,6 +140,32 @@ def run_regression(engine, baseline_path: str, out_path: str = None,
             print(f"{Colors.error(f'Could not write diff JSON: {exc}')}", file=sys.stderr)
     if sarif_path:
         _write_baseline_sarif(engine, baseline, sarif_path)
+    if gate:
+        _apply_gate(diff, gate)
+
+
+def _apply_gate(diff, gate: dict) -> None:
+    """Evaluate the differential CI gate; exit non-zero on failure."""
+    from core.gate import evaluate_gate, format_verdict, gate_to_junit
+
+    verdict = evaluate_gate(
+        diff,
+        new_severity_threshold=gate.get("new_severity"),
+        fail_on_coverage_drop=gate.get("on_coverage_drop", False),
+        coverage_drop_tolerance=gate.get("coverage_tolerance", 0.0),
+    )
+    color = Colors.success if verdict["passed"] else Colors.error
+    print("\n  " + color(format_verdict(verdict)).replace("\n", "\n  "))
+    junit_path = gate.get("junit")
+    if junit_path:
+        try:
+            with open(junit_path, "w", encoding="utf-8") as fh:
+                fh.write(gate_to_junit(verdict))
+            print(f"{Colors.info(f'Gate JUnit written to {junit_path}')}")
+        except OSError as exc:
+            print(f"{Colors.error(f'Could not write gate JUnit: {exc}')}", file=sys.stderr)
+    if not verdict["passed"]:
+        sys.exit(verdict["exit_code"])
 
 
 def _write_baseline_sarif(engine, baseline, sarif_path: str) -> None:
@@ -176,8 +202,18 @@ def apply_post_scan_coverage(engine, config) -> None:
     if config.get("coverage_json"):
         write_coverage_json(engine, config["coverage_json"])
     if config.get("diff_baseline"):
+        gate = None
+        if config.get("gate_new_severity") or config.get("gate_on_coverage_drop"):
+            gate = {
+                "new_severity": config.get("gate_new_severity"),
+                "on_coverage_drop": config.get("gate_on_coverage_drop", False),
+                "coverage_tolerance": config.get("gate_coverage_tolerance", 0.0),
+                "junit": config.get("gate_junit"),
+            }
         try:
             run_regression(engine, config["diff_baseline"], config.get("diff_json"),
-                           sarif_path=config.get("diff_sarif"))
+                           sarif_path=config.get("diff_sarif"), gate=gate)
+        except SystemExit:
+            raise  # gate failure must propagate to set the process exit code
         except Exception as exc:
             print(f"{Colors.error(f'Regression diff failed: {exc}')}", file=sys.stderr)
