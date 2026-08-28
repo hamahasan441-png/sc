@@ -1963,6 +1963,29 @@ class AtomicEngine:
         """
         return list(self._canonical_findings.values())
 
+    def get_coverage_summary(self):
+        """Compute a :class:`core.models.CoverageSummary` for this scan.
+
+        Read-only aggregation over data the engine already holds: the
+        discovered ``TargetSurface`` (endpoints), the enabled modules
+        (validators), and the canonical findings (validated cells). Returns
+        ``None`` if nothing is available to summarize.
+
+        This threads no state through the scan loop — it is safe to call at
+        any time after a scan and is consumed by reporters and the web API.
+        """
+        from core.coverage import build_coverage
+
+        findings = self.get_canonical_findings()
+        if self.surface is None and not findings:
+            return None
+        validators = [
+            name for name, enabled in (self.config.get("modules", {}) or {}).items()
+            if enabled is True
+        ]
+        engine = build_coverage(self.surface, findings, validators=validators or None)
+        return engine.summary()
+
     def _print_attack_results(self):
         """Display rich attack/exploitation results in the console."""
         if not self.post_exploit_results:

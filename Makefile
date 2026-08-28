@@ -47,6 +47,9 @@ run: ## Run a basic scan (set TARGET=https://example.com)
 web: ## Start the web dashboard
 	python main.py --web
 
+benchmark: ## Run the network-free benchmark suite (optional BASELINE=path to gate)
+	python main.py --benchmark $(if $(BASELINE),--benchmark-baseline $(BASELINE),)
+
 docker: ## Build and run with Docker
 	docker compose up --build
 

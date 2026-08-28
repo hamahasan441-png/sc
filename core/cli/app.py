@@ -28,6 +28,8 @@ from core.cli.commands.recon import handle_recon_tools
 from core.cli.commands.report import handle_report_commands
 from core.cli.commands.llm import handle_llm_commands
 from core.cli.commands.scan import handle_scan
+from core.cli.commands.benchmark import handle_benchmark
+from core.cli.commands.calibrate import handle_calibrate
 
 
 def _get_print_banner():
@@ -82,6 +84,14 @@ def run_cli(argv=None):
     # --- Early exit commands (no banner, no DB) ---
     # Tools runtime (portable, status, doctor) - independent of web stack
     if handle_tools_runtime(args):
+        return
+
+    # Benchmark suite (network-free diagnostic) - independent of web/DB stack
+    if handle_benchmark(args):
+        return
+
+    # Confidence calibration report (offline diagnostic)
+    if handle_calibrate(args):
         return
 
     # Banner (unless quiet) — supports legacy patching via main.print_banner
