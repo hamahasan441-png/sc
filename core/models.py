@@ -457,6 +457,103 @@ class FindingGroup:
 
 
 # ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+
+
+class CoverageState:
+    """Lifecycle states for a (endpoint, validator) coverage cell.
+
+    Ordered by strength via :data:`COVERAGE_RANK` so that merges never
+    silently downgrade a stronger observation (e.g. a VALIDATED cell is
+    never demoted back to PLANNED).
+    """
+
+    DISCOVERED = "DISCOVERED"      # endpoint known, nothing planned yet
+    PLANNED = "PLANNED"            # a validator was scheduled for it
+    SKIPPED = "SKIPPED"            # deliberately not run (scope/budget)
+    UNSUPPORTED = "UNSUPPORTED"    # validator can't apply to this endpoint
+    BLOCKED = "BLOCKED"            # couldn't run (auth/WAF/network)
+    TESTED = "TESTED"             # validator ran, no positive finding
+    INCONCLUSIVE = "INCONCLUSIVE"  # validator ran, result ambiguous
+    VALIDATED = "VALIDATED"       # validator ran and confirmed a finding
+
+    ALL = (
+        DISCOVERED, PLANNED, SKIPPED, UNSUPPORTED, BLOCKED,
+        TESTED, INCONCLUSIVE, VALIDATED,
+    )
+
+
+# Strength ranking: a mark() only ever moves a cell to an equal-or-higher rank.
+COVERAGE_RANK: Dict[str, int] = {
+    CoverageState.DISCOVERED: 0,
+    CoverageState.PLANNED: 1,
+    CoverageState.SKIPPED: 2,
+    CoverageState.UNSUPPORTED: 2,
+    CoverageState.BLOCKED: 2,
+    CoverageState.TESTED: 3,
+    CoverageState.INCONCLUSIVE: 3,
+    CoverageState.VALIDATED: 4,
+}
+
+
+@dataclass
+class CoverageRecord:
+    """One coverage cell: the state of a single validator against a single
+    endpoint.  The ``cell_key`` is a stable, param-agnostic identity so the
+    same (endpoint, validator) pair is tracked consistently across runs."""
+
+    endpoint_key: str = ""     # METHOD:netloc:path (param-agnostic)
+    url: str = ""
+    method: str = "GET"
+    validator: str = ""        # module / technique name
+    state: str = CoverageState.DISCOVERED
+    note: str = ""
+
+    @property
+    def cell_key(self) -> str:
+        return f"{self.endpoint_key}::{self.validator}"
+
+    def to_dict(self) -> dict:
+        return {
+            "endpoint_key": self.endpoint_key,
+            "method": self.method,
+            "note": self.note,
+            "state": self.state,
+            "url": self.url,
+            "validator": self.validator,
+        }
+
+
+@dataclass
+class CoverageSummary:
+    """Aggregate coverage metrics for a scan, consumed by reporters/web."""
+
+    endpoints_total: int = 0
+    endpoints_tested: int = 0        # >= TESTED for at least one validator
+    endpoints_validated: int = 0     # >= VALIDATED for at least one validator
+    endpoint_coverage_pct: float = 0.0
+    cells_total: int = 0
+    state_counts: Dict[str, int] = field(default_factory=dict)
+    validator_counts: Dict[str, int] = field(default_factory=dict)
+    untested_endpoints: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "cells_total": self.cells_total,
+            "endpoint_coverage_pct": self.endpoint_coverage_pct,
+            "endpoints_tested": self.endpoints_tested,
+            "endpoints_total": self.endpoints_total,
+            "endpoints_validated": self.endpoints_validated,
+            "state_counts": {k: self.state_counts[k] for k in sorted(self.state_counts)},
+            "untested_endpoints": sorted(self.untested_endpoints),
+            "validator_counts": {
+                k: self.validator_counts[k] for k in sorted(self.validator_counts)
+            },
+        }
+
+
+# ---------------------------------------------------------------------------
 # ScanResult
 # ---------------------------------------------------------------------------
 
@@ -473,9 +570,11 @@ class ScanResult:
     findings: List[CanonicalFinding] = field(default_factory=list)
     groups: List[FindingGroup] = field(default_factory=list)
     surface: Optional[TargetSurface] = None
+    coverage: Optional[CoverageSummary] = None
 
     def to_dict(self) -> dict:
         return {
+            "coverage": self.coverage.to_dict() if self.coverage else None,
             "end_time": self.end_time,
             "findings": [f.to_dict() for f in self.findings],
             "groups": [g.to_dict() for g in self.groups],

@@ -54,7 +54,7 @@ Almost all already exist:
 | Optional LLM layer | ✅ present | `core/llm_base.py`, `core/ai_engine.py` |
 | Web dashboard + API | ✅ present | `web/app.py`, `web/static/app/js/**` |
 | **Event bus** | ⚠️ **gap** | no `EventBus`/`event_bus`; runtime is call-graph driven, not event-driven |
-| **Single CoverageEngine** | ⚠️ **partial** | coverage logic exists but is distributed across scanners, not one engine |
+| **Single CoverageEngine** | ✅ **added this session** | `core/coverage.py` + `CoverageState`/`CoverageRecord`/`CoverageSummary` in `core/models.py`; `AtomicEngine.get_coverage_summary()` |
 
 ## Honest scope note
 
@@ -74,12 +74,16 @@ per-module maturity ratings. Two things about that:
 
 Ranked by value ÷ risk. Each is a concrete vertical slice, not a rewrite.
 
-1. **Coverage engine consolidation** — extract the distributed coverage
-   tracking into one `core/coverage.py` with a new typed `CoverageRecord`
-   (not yet in `core/models.py`, which today defines ScanConfig, TargetSurface,
-   SurfaceEndpoint/Param, Evidence, VerificationResult, CanonicalFinding,
-   FindingGroup, ScanResult) and wire scanners to it. Adds the "what remains
-   untested" answer the product objective calls for.
+1. **Coverage engine** — ✅ **DONE this session.** Added `CoverageState`,
+   `CoverageRecord`, `CoverageSummary` to `core/models.py`; a `CoverageEngine`
+   in `core/coverage.py` (no-downgrade state grid, param-agnostic endpoint
+   identity, deterministic output); `ScanResult.coverage` field; and a
+   read-only `AtomicEngine.get_coverage_summary()` that answers "what remains
+   untested" from surface + findings + enabled modules. 26 unit/integration
+   tests in `tests/test_coverage.py`. Remaining follow-up: emit live
+   PLANNED/TESTED/SKIPPED marks from within the scan loop (today TESTED is
+   inferred from findings; PLANNED from enabled modules) and surface coverage
+   in the web dashboard.
 2. **Event bus (optional)** — only if the dashboard needs incremental updates;
    today it works without one. Low priority unless real-time UI is a goal.
 3. **Silent-failure audit** — 268 `except: pass` sites repo-wide. Most are
