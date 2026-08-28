@@ -49,6 +49,16 @@ brake on the highest-impact claims:
   detection method caps them at VALIDATED.
 - Tests: `tests/test_surface_ledger.py` (14) + `tests/test_finding_state.py`
   (11).
+- **Authorization matrix** (`core/authz_matrix.py`). Implements the spec's
+  `SUBJECT → ROLE → RESOURCE → ACTION → EXPECTED → OBSERVED` grid. Flags every
+  mismatch and classifies the security-critical direction (expected DENY,
+  observed ALLOW) as **horizontal** (accessed another subject's object —
+  IDOR/BOLA/tenant-isolation) or **vertical** (privilege escalation, when role
+  ranks are supplied); untested cells are first-class coverage gaps.
+  Fail-closed: an observation with no prior expectation defaults to expected
+  DENY so an unexpected ALLOW surfaces. Pure accounting — records outcomes the
+  caller supplies, performs no requests, never bypasses the authorization
+  gate. 16 tests in `tests/test_authz_matrix.py`.
 
 ### Safety boundary (declined by design)
 
