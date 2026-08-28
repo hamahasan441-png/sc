@@ -28,6 +28,39 @@ test-suite instability. The suite is now reliably green (0 failures).
 Also fixed the sandbox environment (missing `_cffi_backend`, flask, bs4, etc.)
 — see `ATOMIC_BASELINE.md` → "Environment setup".
 
+## Attack-surface coverage slice (this session)
+
+Realizes the safe core of the "complete attack-surface coverage" spec —
+assurance that no major surface is silently skipped, and a false-positive
+brake on the highest-impact claims:
+
+- **Surface coverage ledger** (`core/surface_ledger.py` + `SurfaceCategory`,
+  `SurfaceCoverageStatus`, `SurfaceLedgerEntry` in `core/models.py`). Tracks
+  each of 16 attack-surface classes (network, web, API, auth, authz, input,
+  file-handling, client-side, business-logic, HTTP-edge, DNS, TLS, cloud,
+  secrets, security-controls, tech/version). Every category starts
+  `NOT_TESTED`, so a surface no module exercised is reported as an explicit
+  blind spot; the report can distinguish `NOT_TESTED` / `TESTED_NO_ISSUE` /
+  `INCONCLUSIVE` / `TESTED_ISSUES` / `SKIPPED` / `BLOCKED` with reasons.
+- **Finding-state model** (`core/finding_state.py` + `FindingState` in
+  `core/models.py`). Derives SUSPECTED → OBSERVED → VALIDATED → CONFIRMED (or
+  REJECTED) from evidence, enforcing the rule that **CRITICAL/HIGH findings
+  require two independent evidence forms to reach CONFIRMED** — a single
+  detection method caps them at VALIDATED.
+- Tests: `tests/test_surface_ledger.py` (14) + `tests/test_finding_state.py`
+  (11).
+
+### Safety boundary (declined by design)
+
+The spec also asked that Atomic "escalate from scanning into invasive
+exploitation automatically" against production targets. That was **not
+built.** Exploitation stays behind the repository's existing authorization
+gate (`core/authorization.py`'s `require_authorized()` / `is_authorized()`,
+plus `core/scope.py`'s `ScopePolicy`), which every post-exploit path must
+call before any destructive/exploitative action. Removing that gate to
+auto-attack production is out of bounds; the coverage/confidence work above
+is the defensible part of the request and is what was delivered.
+
 ## Target architecture vs. reality (evidence-mapped)
 
 The master prompt asks for a canonical runtime with ~30 named subsystems.
