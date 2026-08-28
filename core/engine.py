@@ -1986,6 +1986,23 @@ class AtomicEngine:
         engine = build_coverage(self.surface, findings, validators=validators or None)
         return engine.summary()
 
+    def get_surface_ledger(self):
+        """Build a :class:`core.surface_ledger.SurfaceLedger` for this scan.
+
+        Read-only aggregation: enabled modules mark their attack-surface
+        category as tested; canonical findings mark their category as having
+        issues. Surfaces no enabled module covers stay NOT_TESTED and are
+        reported as explicit blind spots. Threads no state through the scan
+        loop.
+        """
+        from core.surface_map import build_surface_ledger
+
+        enabled = [
+            name for name, on in (self.config.get("modules", {}) or {}).items()
+            if on is True
+        ]
+        return build_surface_ledger(enabled, self.get_canonical_findings())
+
     def _print_attack_results(self):
         """Display rich attack/exploitation results in the console."""
         if not self.post_exploit_results:

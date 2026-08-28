@@ -60,6 +60,24 @@ brake on the highest-impact claims:
   caller supplies, performs no requests, never bypasses the authorization
   gate. 16 tests in `tests/test_authz_matrix.py`.
 
+### Wired into the live scan + report (this session)
+
+The accounting above is no longer just unit fixtures — a real run emits it:
+
+- `core/surface_map.py` maps every scan module / finding technique to its
+  primary attack-surface category (unmapped names stay `None`, so coverage is
+  never over-claimed).
+- `AtomicEngine.get_surface_ledger()` builds a per-run `SurfaceLedger` from the
+  enabled modules (tested) and canonical findings (issues), read-only.
+- `core/output_phase.py` populates `coverage` (per-endpoint) and
+  `surface_coverage` (per-category) best-effort and passes them to the
+  reporter; a coverage error can never abort report generation.
+- `core/reporter.py`'s JSON report now carries `coverage` and
+  `surface_coverage` blocks, so the report answers "what was tested / not
+  tested / had issues" for an actual scan. Verified end-to-end: an IDOR
+  finding lands under AUTHORIZATION (`TESTED_ISSUES` + finding id), untouched
+  surfaces list as blind spots. Tests: `tests/test_surface_map.py` (12).
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive
