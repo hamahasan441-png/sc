@@ -58,6 +58,12 @@ def add_misc_arguments(parser: argparse.ArgumentParser):
     g7.add_argument("--kill-chains", action="store_true", help="Generate attack kill chain analysis from findings")
     g7.add_argument("--api-spec", action="store_true", help="Generate OpenAPI 3.0 spec for REST API and exit")
 
+    g_bench = parser.add_argument_group("Diagnostics")
+    g_bench.add_argument("--benchmark", action="store_true", help="Run the local benchmark suite (network-free) and exit")
+    g_bench.add_argument("--benchmark-json", metavar="PATH", help="Write benchmark results as JSON to PATH")
+    g_bench.add_argument("--benchmark-baseline", metavar="PATH", help="Compare benchmark results against a saved baseline JSON; exit non-zero on regression")
+    g_bench.add_argument("--benchmark-tolerance", type=float, default=None, help="Regression tolerance fraction for --benchmark-baseline (default: 0.30)")
+
     g8 = parser.add_argument_group("Security Testing Profiles")
     g8.add_argument("--quick", action="store_true", help="Quick scan profile (fast, limited depth)")
     g8.add_argument("--standard", action="store_true", help="Standard scan profile (balanced)")

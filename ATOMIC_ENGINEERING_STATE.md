@@ -84,16 +84,22 @@ Ranked by value ÷ risk. Each is a concrete vertical slice, not a rewrite.
    PLANNED/TESTED/SKIPPED marks from within the scan loop (today TESTED is
    inferred from findings; PLANNED from enabled modules) and surface coverage
    in the web dashboard.
-2. **Event bus (optional)** — only if the dashboard needs incremental updates;
+2. **`atomic benchmark` command** — ✅ **DONE this session.** `core/benchmark.py`
+   is a deterministic, network-free suite over real hot paths (model
+   serialization, coverage build, correlation, canonical JSON). Wired as
+   `--benchmark` / `--benchmark-json` / `--benchmark-baseline`
+   (`--benchmark-tolerance`), with a CI-usable regression gate (exit 1 on a
+   >tolerance throughput drop) and a `make benchmark` target. 16 tests in
+   `tests/test_benchmark.py`.
+
+3. **Confidence calibration harness** *(next up)* — the prompt's "predicted vs.
+   actual confirmation rate" needs deterministic fixtures; `core/scorer.py` +
+   `tests/golden/` are the foundation to build it on.
+4. **Event bus (optional)** — only if the dashboard needs incremental updates;
    today it works without one. Low priority unless real-time UI is a goal.
-3. **Silent-failure audit** — 268 `except: pass` sites repo-wide. Most are
+5. **Silent-failure audit** — 268 `except: pass` sites repo-wide. Most are
    deliberate per-probe swallows in a scanner, so this is a *careful, per-site*
    review, not a mass edit. Convert only hot-path swallows to typed errors.
-4. **Confidence calibration harness** — the prompt's "predicted vs. actual
-   confirmation rate" needs deterministic fixtures; `core/scorer.py` +
-   `tests/golden/` are the foundation to build it on.
-5. **Benchmark command** — no `atomic benchmark` today; a small harness over
-   the mock fixtures would make the performance budgets in the prompt real.
 
 ## What is intentionally NOT done
 
