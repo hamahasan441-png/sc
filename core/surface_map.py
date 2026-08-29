@@ -71,6 +71,8 @@ MODULE_SURFACE_CATEGORY: Dict[str, str] = {
     "discovery": C.WEB_APP,
     # TLS / cryptographic configuration
     "tls": C.TLS_CRYPTO,
+    # Secrets exposure
+    "secrets": C.SECRETS,
     # File handling
     "uploader": C.FILE_HANDLING,
     # Security controls

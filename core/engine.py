@@ -449,6 +449,8 @@ class AtomicEngine:
             # TLS / cryptographic configuration (non-invasive) — closes the
             # TLS_CRYPTO attack-surface blind spot.
             "tls": ("modules.tls_scan", "TLSScanModule"),
+            # Secrets exposure (non-invasive) — closes the SECRETS blind spot.
+            "secrets": ("modules.secrets_scan", "SecretsScanModule"),
         }
 
         modules_config = self.config.get("modules", {})

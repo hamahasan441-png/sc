@@ -224,6 +224,22 @@ wrapper that degrades gracefully on connection failure. Registered as the
 ledger no longer reports it as an untested blind spot. Tests:
 `tests/test_tls_scan.py` (21). Remaining zero-module blind spot: `SECRETS`.
 
+### Secrets module — zero hard blind spots (this session)
+
+`modules/secrets_scan.py` closes the last hard blind spot (SECRETS):
+non-invasive detection of exposed API keys, cloud credentials, tokens, private
+keys and high-entropy secret assignments in responses and linked same-origin
+JS. Detected values are **always masked** before reaching a finding/report —
+exposure is proven without redistributing the live secret. Detection is a pure
+`detect_secrets(text)` function (entropy-gated generics, placeholder filtering,
+dedup) with a thin `test_url` wrapper. Registered as `secrets`/`--secrets`,
+mapped to `SurfaceCategory.SECRETS`. Tests: `tests/test_secrets_scan.py` (18).
+
+**Coverage audit now: 0 hard blind spots** — all 16 attack-surface categories
+have at least one validator. Remaining depth work is "thin" categories
+(AUTHORIZATION, FILE_HANDLING, CLOUD_PLATFORM, TECH_VERSION, and the two just
+added), not blind spots.
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive
