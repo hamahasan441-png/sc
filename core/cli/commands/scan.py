@@ -74,7 +74,17 @@ def _build_config_from_args(args):
         "h2_smuggling", "cache_poisoning", "api_abuse", "deep_scan", "gatebreaker",
         "firewall_bypass", "tls", "secrets",
         "shield_detect", "real_ip", "passive_recon", "enrich", "chain_detect",
-        "exploit_search", "agent_scan", "attack_map"
+        "exploit_search", "agent_scan", "attack_map",
+        # Complete coverage modules
+        "dns_attacks", "snmp_enum", "smb_attacks", "ssh_attacks", "rdp_attacks",
+        "nfs_enum", "rpc_enum", "vnc_attacks", "ipv6_attacks", "vlan_hopping",
+        "vpn_attacks", "dhcp_attacks", "arp_attacks", "icmp_attacks",
+        "csrf", "clickjacking", "host_header", "mass_assignment", "webdav",
+        "ssi_injection", "soap_wsdl", "grpc", "webhook_ssrf",
+        "container_escape", "cicd_injection", "aws_iam_privesc", "service_mesh",
+        "ics_protocols", "typosquatting", "covert_channels", "crypto_weakness",
+        "credential_dump", "lateral_movement", "ad_attacks",
+        "coverage_fuzz", "symbolic_exec",
     ]
 
     # BUG FIX (TST-006/CLI): these flags were parsed but never propagated to

@@ -451,6 +451,52 @@ class AtomicEngine:
             "tls": ("modules.tls_scan", "TLSScanModule"),
             # Secrets exposure (non-invasive) — closes the SECRETS blind spot.
             "secrets": ("modules.secrets_scan", "SecretsScanModule"),
+            # ── NEW: Complete coverage modules ──────────────────────────
+            # Network Infrastructure
+            "dns_attacks": ("modules.dns_attacks", "DNSAttackModule"),
+            "snmp_enum": ("modules.snmp_enum", "SNMPEnumModule"),
+            "smb_attacks": ("modules.smb_attacks", "SMBAttackModule"),
+            "ssh_attacks": ("modules.ssh_attacks", "SSHAttackModule"),
+            "rdp_attacks": ("modules.rdp_attacks", "RDPAttackModule"),
+            "nfs_enum": ("modules.nfs_enum", "NFSEnumModule"),
+            "rpc_enum": ("modules.rpc_enum", "RPCEnumModule"),
+            "vnc_attacks": ("modules.vnc_attacks", "VNCAttackModule"),
+            "ipv6_attacks": ("modules.ipv6_attacks", "IPv6AttackModule"),
+            "vlan_hopping": ("modules.vlan_hopping", "VLANHoppingModule"),
+            "vpn_attacks": ("modules.vpn_attacks", "VPNAttackModule"),
+            "dhcp_attacks": ("modules.dhcp_attacks", "DHCPAttackModule"),
+            "arp_attacks": ("modules.arp_attacks", "ARPAttackModule"),
+            "icmp_attacks": ("modules.icmp_attacks", "ICMPAttackModule"),
+            # Web Applications
+            "csrf": ("modules.csrf", "CSRFModule"),
+            "clickjacking": ("modules.clickjacking", "ClickjackingModule"),
+            "host_header": ("modules.host_header", "HostHeaderModule"),
+            "mass_assignment": ("modules.mass_assignment", "MassAssignmentModule"),
+            "webdav": ("modules.webdav", "WebDAVModule"),
+            "ssi_injection": ("modules.ssi_injection", "SSIInjectionModule"),
+            # APIs
+            "soap_wsdl": ("modules.soap_wsdl", "SOAPModule"),
+            "grpc": ("modules.grpc", "GRPCModule"),
+            "webhook_ssrf": ("modules.webhook_ssrf", "WebhookSSRFModule"),
+            # Cloud & Container
+            "container_escape": ("modules.container_escape", "ContainerEscapeModule"),
+            "cicd_injection": ("modules.cicd_injection", "CICDInjectionModule"),
+            "aws_iam_privesc": ("modules.aws_iam_privesc", "AWSIAMPrivescModule"),
+            "service_mesh": ("modules.service_mesh", "ServiceMeshModule"),
+            # IoT/OT/ICS
+            "ics_protocols": ("modules.ics_protocols", "ICSProtocolModule"),
+            # Supply Chain
+            "typosquatting": ("modules.typosquatting", "TyposquattingModule"),
+            # Cryptography
+            "covert_channels": ("modules.covert_channels", "CovertChannelModule"),
+            "crypto_weakness": ("modules.crypto_weakness", "CryptoWeaknessModule"),
+            # Post-Exploitation
+            "credential_dump": ("modules.credential_dump", "CredentialDumpModule"),
+            "lateral_movement": ("modules.lateral_movement", "LateralMovementModule"),
+            "ad_attacks": ("modules.ad_attacks", "ADAttackModule"),
+            # Zero-Day
+            "coverage_fuzz": ("modules.coverage_fuzz", "CoverageFuzzModule"),
+            "symbolic_exec": ("modules.symbolic_exec", "SymbolicExecModule"),
         }
 
         modules_config = self.config.get("modules", {})
