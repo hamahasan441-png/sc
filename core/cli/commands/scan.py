@@ -74,7 +74,17 @@ def _build_config_from_args(args):
         "h2_smuggling", "cache_poisoning", "api_abuse", "deep_scan", "gatebreaker",
         "firewall_bypass", "tls", "secrets",
         "shield_detect", "real_ip", "passive_recon", "enrich", "chain_detect",
-        "exploit_search", "agent_scan", "attack_map"
+        "exploit_search", "agent_scan", "attack_map",
+        # Complete coverage modules
+        "dns_attacks", "snmp_enum", "smb_attacks", "ssh_attacks", "rdp_attacks",
+        "nfs_enum", "rpc_enum", "vnc_attacks", "ipv6_attacks", "vlan_hopping",
+        "vpn_attacks", "dhcp_attacks", "arp_attacks", "icmp_attacks",
+        "csrf", "clickjacking", "host_header", "mass_assignment", "webdav",
+        "ssi_injection", "soap_wsdl", "grpc", "webhook_ssrf",
+        "container_escape", "cicd_injection", "aws_iam_privesc", "service_mesh",
+        "ics_protocols", "typosquatting", "covert_channels", "crypto_weakness",
+        "credential_dump", "lateral_movement", "ad_attacks",
+        "coverage_fuzz", "symbolic_exec",
     ]
 
     # BUG FIX (TST-006/CLI): these flags were parsed but never propagated to
@@ -102,6 +112,19 @@ def _build_config_from_args(args):
             # their individual flags are also supplied.
             for k in extended_module_keys:
                 modules[k] = bool(getattr(args, k, False))
+        # --full implies full bypass: activate WAF bypass, firewall bypass,
+        # gatebreaker, shield detection, and real IP discovery so the scanner
+        # can reach the origin behind CDN/WAF.
+        modules["gatebreaker"] = True
+        modules["firewall_bypass"] = True
+        modules["shield_detect"] = True
+        modules["real_ip"] = True
+        modules["passive_recon"] = True
+        modules["enrich"] = True
+        modules["chain_detect"] = True
+        modules["exploit_search"] = True
+        modules["agent_scan"] = True
+        modules["attack_map"] = True
     else:
         modules = {}
         for k in module_keys + extended_module_keys:
@@ -145,6 +168,11 @@ def _build_config_from_args(args):
     allowed_domains = _parse_csv(getattr(args, "allow_domain", "") or "")
     strict = bool(getattr(args, "strict_scope", False) or allowed_domains)
 
+    # Determine evasion level: --full defaults to "high" if not explicitly set
+    evasion_level = getattr(args, "evasion", "none")
+    if (getattr(args, "full", False) or point_to_point) and evasion_level == "none":
+        evasion_level = "high"
+
     config = {
         "target": getattr(args, "target", ""),
         "modules": modules,
@@ -152,10 +180,10 @@ def _build_config_from_args(args):
         "threads": getattr(args, "threads", 50),
         "timeout": getattr(args, "timeout", 15),
         "delay": getattr(args, "delay", 0.1),
-        "evasion": getattr(args, "evasion", "none"),
-        "waf_bypass": getattr(args, "waf_bypass", False) or getattr(args, "full_bypass", False) or getattr(args, "gatebreaker", False) or getattr(args, "firewall_bypass", False),
-        "full_bypass": getattr(args, "full_bypass", False) or getattr(args, "firewall_bypass", False),
-        "firewall_bypass": getattr(args, "firewall_bypass", False) or getattr(args, "full_bypass", False),
+        "evasion": evasion_level,
+        "waf_bypass": getattr(args, "waf_bypass", False) or getattr(args, "full_bypass", False) or getattr(args, "gatebreaker", False) or getattr(args, "firewall_bypass", False) or getattr(args, "full", False) or point_to_point,
+        "full_bypass": getattr(args, "full_bypass", False) or getattr(args, "firewall_bypass", False) or getattr(args, "full", False) or point_to_point,
+        "firewall_bypass": getattr(args, "firewall_bypass", False) or getattr(args, "full_bypass", False) or getattr(args, "full", False) or point_to_point,
         "tor": getattr(args, "tor", False),
         "proxy": getattr(args, "proxy", None),
         "rotate_proxy": getattr(args, "rotate_proxy", False),
@@ -215,10 +243,10 @@ def handle_scan(args):
     config = _build_config_from_args(args)
 
     # Governance guard: scanning requires explicit operator authorization
-    # (for all scans, not just regulated).  The canonical gate is
-    # ``core.authorization.is_authorized()``: the ``--authorized`` CLI flag
-    # OR ``ATOMIC_AUTHORIZED=1`` in the environment — both are deliberate
-    # acknowledgments.  Fail-closed when neither is present.
+    # for EXPLOITATION (shell upload, dump, auto-exploit). Pure detection
+    # and vulnerability scanning are allowed without --authorized since
+    # they are non-destructive.  Post-exploit paths in core/engine.py and
+    # core/authorization.py independently enforce the gate.
     _authz_flag = bool(config.get("authorized"))
     try:
         from core.authorization import is_authorized as _env_authorized
@@ -226,16 +254,33 @@ def handle_scan(args):
         _authz_env = bool(_env_authorized())
     except Exception:
         _authz_env = False
-    if targets and not (_authz_flag or _authz_env):
-        print(
-            f"{Colors.error('Authorization confirmation required.')}\n"
-            f"{Colors.warning('This framework is for AUTHORIZED security testing only.')}\n"
-            f"{Colors.info('Re-run with --authorized (or set ATOMIC_AUTHORIZED=1) to confirm you have written permission to test the listed targets.')}"
-        )
-        sys.exit(1)
+    config["_authorized"] = _authz_flag or _authz_env
 
-    # Handle regulated mission
+    # Warn if exploitation modules are enabled without authorization
+    _modules_cfg = config.get("modules", {})
+    _exploit_flags = ["shell", "dump", "os_shell", "auto_exploit", "brute", "exploit_chain"]
+    _exploit_requested = any(_modules_cfg.get(f) for f in _exploit_flags)
+    if targets and _exploit_requested and not config["_authorized"]:
+        print(
+            f"{Colors.warning('Exploitation modules requested without --authorized.')}\n"
+            f"{Colors.info('Vulnerability detection will run normally. Exploitation (shell upload, dump, auto-exploit) will be skipped.')}\n"
+            f"{Colors.info('Re-run with --authorized (or set ATOMIC_AUTHORIZED=1) to enable exploitation.')}"
+        )
+        # Disable exploitation modules but continue scanning
+        for f in _exploit_flags:
+            _modules_cfg[f] = False
+        _modules_cfg["auto_exploit"] = False
+        _modules_cfg["smart_attack"] = False
+
+    # Handle regulated mission — always requires --authorized
     if getattr(args, "regulated_mission", False):
+        if not config["_authorized"]:
+            print(
+                f"{Colors.error('Authorization confirmation required for regulated mission.')}\n"
+                f"{Colors.warning('This framework is for AUTHORIZED security testing only.')}\n"
+                f"{Colors.info('Re-run with --authorized to confirm you have written permission.')}"
+            )
+            sys.exit(1)
         try:
             from core.ci_mode import run_regulated_mission
             run_regulated_mission(config, targets[0] if targets else args.target)

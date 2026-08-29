@@ -88,7 +88,9 @@ class AttackerPolicy:
         # scans, whose config has no ``authorized`` key) silently enabled
         # streaming exploitation.  The CLI always sets the key explicitly
         # (scan.py), so this only closes the ungated programmatic paths.
-        enabled = (full_attack or smart) and bool(config.get("authorized", False))
+        # Check both "authorized" (CLI flag) and "_authorized" (env + CLI).
+        is_auth = bool(config.get("authorized", False)) or bool(config.get("_authorized", False))
+        enabled = (full_attack or smart) and is_auth
         unsafe = bool(config.get("unsafe_mode"))
 
         # --unsafe-mode (per-run, gated on --authorized at the CLI):

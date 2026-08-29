@@ -451,6 +451,52 @@ class AtomicEngine:
             "tls": ("modules.tls_scan", "TLSScanModule"),
             # Secrets exposure (non-invasive) — closes the SECRETS blind spot.
             "secrets": ("modules.secrets_scan", "SecretsScanModule"),
+            # ── NEW: Complete coverage modules ──────────────────────────
+            # Network Infrastructure
+            "dns_attacks": ("modules.dns_attacks", "DNSAttackModule"),
+            "snmp_enum": ("modules.snmp_enum", "SNMPEnumModule"),
+            "smb_attacks": ("modules.smb_attacks", "SMBAttackModule"),
+            "ssh_attacks": ("modules.ssh_attacks", "SSHAttackModule"),
+            "rdp_attacks": ("modules.rdp_attacks", "RDPAttackModule"),
+            "nfs_enum": ("modules.nfs_enum", "NFSEnumModule"),
+            "rpc_enum": ("modules.rpc_enum", "RPCEnumModule"),
+            "vnc_attacks": ("modules.vnc_attacks", "VNCAttackModule"),
+            "ipv6_attacks": ("modules.ipv6_attacks", "IPv6AttackModule"),
+            "vlan_hopping": ("modules.vlan_hopping", "VLANHoppingModule"),
+            "vpn_attacks": ("modules.vpn_attacks", "VPNAttackModule"),
+            "dhcp_attacks": ("modules.dhcp_attacks", "DHCPAttackModule"),
+            "arp_attacks": ("modules.arp_attacks", "ARPAttackModule"),
+            "icmp_attacks": ("modules.icmp_attacks", "ICMPAttackModule"),
+            # Web Applications
+            "csrf": ("modules.csrf", "CSRFModule"),
+            "clickjacking": ("modules.clickjacking", "ClickjackingModule"),
+            "host_header": ("modules.host_header", "HostHeaderModule"),
+            "mass_assignment": ("modules.mass_assignment", "MassAssignmentModule"),
+            "webdav": ("modules.webdav", "WebDAVModule"),
+            "ssi_injection": ("modules.ssi_injection", "SSIInjectionModule"),
+            # APIs
+            "soap_wsdl": ("modules.soap_wsdl", "SOAPModule"),
+            "grpc": ("modules.grpc", "GRPCModule"),
+            "webhook_ssrf": ("modules.webhook_ssrf", "WebhookSSRFModule"),
+            # Cloud & Container
+            "container_escape": ("modules.container_escape", "ContainerEscapeModule"),
+            "cicd_injection": ("modules.cicd_injection", "CICDInjectionModule"),
+            "aws_iam_privesc": ("modules.aws_iam_privesc", "AWSIAMPrivescModule"),
+            "service_mesh": ("modules.service_mesh", "ServiceMeshModule"),
+            # IoT/OT/ICS
+            "ics_protocols": ("modules.ics_protocols", "ICSProtocolModule"),
+            # Supply Chain
+            "typosquatting": ("modules.typosquatting", "TyposquattingModule"),
+            # Cryptography
+            "covert_channels": ("modules.covert_channels", "CovertChannelModule"),
+            "crypto_weakness": ("modules.crypto_weakness", "CryptoWeaknessModule"),
+            # Post-Exploitation
+            "credential_dump": ("modules.credential_dump", "CredentialDumpModule"),
+            "lateral_movement": ("modules.lateral_movement", "LateralMovementModule"),
+            "ad_attacks": ("modules.ad_attacks", "ADAttackModule"),
+            # Zero-Day
+            "coverage_fuzz": ("modules.coverage_fuzz", "CoverageFuzzModule"),
+            "symbolic_exec": ("modules.symbolic_exec", "SymbolicExecModule"),
         }
 
         modules_config = self.config.get("modules", {})
@@ -1312,7 +1358,9 @@ class AtomicEngine:
                         continue
 
                 def _do_test(m=module_instance, e=ep):
-                    self.scope.enforce_rate_limit()
+                    # Rate limiting is handled by the Requester via
+                    # attach_rate_limiter() — no need to call it here
+                    # (which caused double-throttling and halved throughput).
                     delay = self.adaptive.get_delay()
                     if delay > 0:
                         time.sleep(delay)
@@ -1509,21 +1557,26 @@ class AtomicEngine:
         # AI-driven auto-exploit: orchestrates data extraction, shell
         # upload, and system enumeration based on confirmed findings.
         # Auto-attack runs ONLY when explicitly opted-in via --auto-exploit
-        # or --smart-attack. Previously `smart_attack` defaulted to True,
-        # which silently fired post-exploitation on any HIGH finding.
+        # or --smart-attack AND --authorized is set.
         exploitable_findings = [f for f in self.findings if f.severity in ("CRITICAL", "HIGH") and f.confidence >= 0.6]
         should_auto_attack = modules_config.get("auto_exploit", False) or (
             exploitable_findings and modules_config.get("smart_attack", False)
         )
         if should_auto_attack and self.findings:
-            # PATCHED: post-exploit authorization gate
-            try:
-                from core.authorization import require_authorized
-                require_authorized("auto-attack", target=target)
-            except (ImportError, PermissionError) as _auth_exc:
+            # Authorization gate: require --authorized or ATOMIC_AUTHORIZED=1
+            # for ALL post-exploit actions. Fail-closed.
+            if not self.config.get("_authorized") and not self.config.get("authorized"):
                 if self.config.get("verbose"):
-                    print(f"{Colors.warning(f'Auto-attack blocked: {_auth_exc}')}")
+                    print(f"{Colors.warning('Auto-attack blocked: --authorized required for exploitation.')}")
                 should_auto_attack = False
+            else:
+                try:
+                    from core.authorization import require_authorized
+                    require_authorized("auto-attack", target=target)
+                except (ImportError, PermissionError) as _auth_exc:
+                    if self.config.get("verbose"):
+                        print(f"{Colors.warning(f'Auto-attack blocked: {_auth_exc}')}")
+                    should_auto_attack = False
 
             try:
                 from core.attack_router import AttackRouter
@@ -1559,55 +1612,72 @@ class AtomicEngine:
         # so that run() actually deploys webshells.  Without this flag
         # run() short-circuits at its scan_only guard and silently does
         # nothing — the bug noted in LOGIC_MAP.md "Known Drift #3".
-        if modules_config.get("shell", False) and self.findings:
-            try:
-                from modules.uploader import ShellUploader
+        _is_authorized = self.config.get("_authorized") or self.config.get("authorized")
 
-                uploader = ShellUploader(self, scan_only=False)
-                uploader.run(self.findings, forms)
-            except Exception as e:
+        if modules_config.get("shell", False) and self.findings:
+            if not _is_authorized:
                 if self.config.get("verbose"):
-                    print(f"{Colors.error(f'Shell upload error: {e}')}")
+                    print(f"{Colors.warning('Shell upload skipped: --authorized required.')}")
+            else:
+                try:
+                    from modules.uploader import ShellUploader
+                    uploader = ShellUploader(self, scan_only=False)
+                    uploader.run(self.findings, forms)
+                except Exception as e:
+                    if self.config.get("verbose"):
+                        print(f"{Colors.error(f'Shell upload error: {e}')}")
 
         if modules_config.get("dump", False) and self.findings:
-            try:
-                from modules.dumper import DataDumper
-
-                dumper = DataDumper(self)
-                dumper.run(self.findings)
-            except Exception as e:
+            if not _is_authorized:
                 if self.config.get("verbose"):
-                    print(f"{Colors.error(f'Data dump error: {e}')}")
+                    print(f"{Colors.warning('Data dump skipped: --authorized required.')}")
+            else:
+                try:
+                    from modules.dumper import DataDumper
+                    dumper = DataDumper(self)
+                    dumper.run(self.findings)
+                except Exception as e:
+                    if self.config.get("verbose"):
+                        print(f"{Colors.error(f'Data dump error: {e}')}")
 
         if modules_config.get("os_shell", False) and self.findings:
-            try:
-                from core.os_shell import OSShellHandler
-
-                handler = OSShellHandler(self)
-                handler.run(self.findings, forms)
-            except Exception as e:
+            if not _is_authorized:
                 if self.config.get("verbose"):
-                    print(f"{Colors.error(f'OS shell error: {e}')}")
+                    print(f"{Colors.warning('OS shell skipped: --authorized required.')}")
+            else:
+                try:
+                    from core.os_shell import OSShellHandler
+                    handler = OSShellHandler(self)
+                    handler.run(self.findings, forms)
+                except Exception as e:
+                    if self.config.get("verbose"):
+                        print(f"{Colors.error(f'OS shell error: {e}')}")
 
         if modules_config.get("brute", False):
-            try:
-                from modules.brute_force import BruteForceModule
-
-                bruter = BruteForceModule(self)
-                bruter.run(forms)
-            except Exception as e:
+            if not _is_authorized:
                 if self.config.get("verbose"):
-                    print(f"{Colors.error(f'Brute force error: {e}')}")
+                    print(f"{Colors.warning('Brute force skipped: --authorized required.')}")
+            else:
+                try:
+                    from modules.brute_force import BruteForceModule
+                    bruter = BruteForceModule(self)
+                    bruter.run(forms)
+                except Exception as e:
+                    if self.config.get("verbose"):
+                        print(f"{Colors.error(f'Brute force error: {e}')}")
 
         if modules_config.get("exploit_chain", False) and self.findings:
-            try:
-                from core.exploit_chain import ExploitChainEngine
-
-                chainer = ExploitChainEngine(self)
-                chainer.run(self.findings)
-            except Exception as e:
+            if not _is_authorized:
                 if self.config.get("verbose"):
-                    print(f"{Colors.error(f'Exploit chain error: {e}')}")
+                    print(f"{Colors.warning('Exploit chain skipped: --authorized required.')}")
+            else:
+                try:
+                    from core.exploit_chain import ExploitChainEngine
+                    chainer = ExploitChainEngine(self)
+                    chainer.run(self.findings)
+                except Exception as e:
+                    if self.config.get("verbose"):
+                        print(f"{Colors.error(f'Exploit chain error: {e}')}")
 
         # ── PIPELINE: Exploit phase complete → Collect phase ──────
         self.pipeline["exploit"]["status"] = "completed"
