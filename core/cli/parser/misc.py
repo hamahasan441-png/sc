@@ -72,6 +72,13 @@ def add_misc_arguments(parser: argparse.ArgumentParser):
     g_cov.add_argument("--coverage-json", metavar="PATH", help="Write the full coverage picture (coverage + surface_coverage + coverage_plan) as JSON to PATH")
     g_cov.add_argument("--auto-close", action="store_true", help="After the scan, auto-run the remaining NON-INVASIVE validations to close coverage gaps (exploitation stays gated)")
     g_cov.add_argument("--coverage-budget", type=int, default=100, help="Max validations to run during --auto-close (default: 100)")
+    g_cov.add_argument("--diff-baseline", metavar="PATH", help="After the scan, diff findings + coverage against a previous report JSON (NEW/FIXED/PERSISTING/CHANGED) for remediation retest")
+    g_cov.add_argument("--diff-json", metavar="PATH", help="Write the regression diff as JSON to PATH")
+    g_cov.add_argument("--diff-sarif", metavar="PATH", help="Write baseline-aware SARIF (results stamped new/unchanged/updated vs --diff-baseline) to PATH for CI code-scanning")
+    g_cov.add_argument("--gate-new-severity", metavar="SEV", choices=["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"], help="CI gate: exit non-zero if any NEW finding (vs --diff-baseline) is at or above this severity")
+    g_cov.add_argument("--gate-on-coverage-drop", action="store_true", help="CI gate: exit non-zero if endpoint coverage dropped vs --diff-baseline")
+    g_cov.add_argument("--gate-coverage-tolerance", type=float, default=0.0, help="Allowed coverage %% dip before --gate-on-coverage-drop fails (default: 0)")
+    g_cov.add_argument("--gate-junit", metavar="PATH", help="Write the CI gate result as JUnit XML to PATH")
 
     g8 = parser.add_argument_group("Security Testing Profiles")
     g8.add_argument("--quick", action="store_true", help="Quick scan profile (fast, limited depth)")

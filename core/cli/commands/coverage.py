@@ -98,6 +98,95 @@ def run_auto_close(engine, budget: int = 100) -> dict:
     return report
 
 
+def build_current_report(engine) -> dict:
+    """Assemble a report-shaped dict for the current scan (for diffing)."""
+    findings = []
+    try:
+        for cf in engine.get_canonical_findings():
+            findings.append(cf.to_dict() if hasattr(cf, "to_dict") else cf)
+    except Exception:
+        findings = []
+    pic = collect_coverage(engine)
+    return {
+        "scan_id": getattr(engine, "scan_id", ""),
+        "target": getattr(engine, "target", ""),
+        "findings": findings,
+        "coverage": pic.get("coverage"),
+        "surface_coverage": pic.get("surface_coverage"),
+    }
+
+
+def run_regression(engine, baseline_path: str, out_path: str = None,
+                   sarif_path: str = None, gate: dict = None) -> None:
+    """Diff the current scan against a baseline report and print the result."""
+    from core.regression import diff_reports, format_diff
+
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as fh:
+            baseline = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"{Colors.error(f'Could not read baseline report: {exc}')}", file=sys.stderr)
+        return
+
+    diff = diff_reports(baseline, build_current_report(engine))
+    print(f"\n  {Colors.BOLD}Remediation Retest{Colors.RESET}")
+    print("    " + format_diff(diff).replace("\n", "\n    "))
+    if out_path:
+        try:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(diff, fh, indent=2, sort_keys=True)
+            print(f"{Colors.info(f'Regression diff written to {out_path}')}")
+        except OSError as exc:
+            print(f"{Colors.error(f'Could not write diff JSON: {exc}')}", file=sys.stderr)
+    if sarif_path:
+        _write_baseline_sarif(engine, baseline, sarif_path)
+    if gate:
+        _apply_gate(diff, gate)
+
+
+def _apply_gate(diff, gate: dict) -> None:
+    """Evaluate the differential CI gate; exit non-zero on failure."""
+    from core.gate import evaluate_gate, format_verdict, gate_to_junit
+
+    verdict = evaluate_gate(
+        diff,
+        new_severity_threshold=gate.get("new_severity"),
+        fail_on_coverage_drop=gate.get("on_coverage_drop", False),
+        coverage_drop_tolerance=gate.get("coverage_tolerance", 0.0),
+    )
+    color = Colors.success if verdict["passed"] else Colors.error
+    print("\n  " + color(format_verdict(verdict)).replace("\n", "\n  "))
+    junit_path = gate.get("junit")
+    if junit_path:
+        try:
+            with open(junit_path, "w", encoding="utf-8") as fh:
+                fh.write(gate_to_junit(verdict))
+            print(f"{Colors.info(f'Gate JUnit written to {junit_path}')}")
+        except OSError as exc:
+            print(f"{Colors.error(f'Could not write gate JUnit: {exc}')}", file=sys.stderr)
+    if not verdict["passed"]:
+        sys.exit(verdict["exit_code"])
+
+
+def _write_baseline_sarif(engine, baseline, sarif_path: str) -> None:
+    """Write SARIF with results stamped new/unchanged/updated vs baseline."""
+    from core.models import ScanResult
+    from core.reporter import ReportGenerator
+
+    sr = ScanResult(
+        scan_id=getattr(engine, "scan_id", ""),
+        target=getattr(engine, "target", ""),
+        findings=list(engine.get_canonical_findings()),
+    )
+    sarif = ReportGenerator.scan_result_to_canonical_sarif(sr, baseline=baseline)
+    try:
+        with open(sarif_path, "w", encoding="utf-8") as fh:
+            json.dump(sarif, fh, indent=2, sort_keys=True)
+        print(f"{Colors.info(f'Baseline-aware SARIF written to {sarif_path}')}")
+    except OSError as exc:
+        print(f"{Colors.error(f'Could not write SARIF: {exc}')}", file=sys.stderr)
+
+
 def apply_post_scan_coverage(engine, config) -> None:
     """Run the coverage hooks selected on the CLI, in order."""
     if config.get("auto_close"):
@@ -112,3 +201,19 @@ def apply_post_scan_coverage(engine, config) -> None:
             print(f"{Colors.error(f'Coverage report failed: {exc}')}", file=sys.stderr)
     if config.get("coverage_json"):
         write_coverage_json(engine, config["coverage_json"])
+    if config.get("diff_baseline"):
+        gate = None
+        if config.get("gate_new_severity") or config.get("gate_on_coverage_drop"):
+            gate = {
+                "new_severity": config.get("gate_new_severity"),
+                "on_coverage_drop": config.get("gate_on_coverage_drop", False),
+                "coverage_tolerance": config.get("gate_coverage_tolerance", 0.0),
+                "junit": config.get("gate_junit"),
+            }
+        try:
+            run_regression(engine, config["diff_baseline"], config.get("diff_json"),
+                           sarif_path=config.get("diff_sarif"), gate=gate)
+        except SystemExit:
+            raise  # gate failure must propagate to set the process exit code
+        except Exception as exc:
+            print(f"{Colors.error(f'Regression diff failed: {exc}')}", file=sys.stderr)

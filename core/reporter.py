@@ -1035,8 +1035,16 @@ class ReportGenerator:
         return json.dumps(scan_result.to_dict(), sort_keys=True, indent=indent, default=str)
 
     @staticmethod
-    def scan_result_to_canonical_sarif(scan_result) -> dict:
+    def scan_result_to_canonical_sarif(scan_result, baseline=None) -> dict:
         """Pure canonical SARIF v2.1.0 object from a ``ScanResult``.
+
+        When ``baseline`` (a previous report dict with a ``findings`` list) is
+        supplied, each result is stamped with SARIF's native ``baselineState``
+        — ``new`` (not in the baseline), ``updated`` (present but severity or
+        confidence moved), or ``unchanged`` — so CI code-scanning can surface
+        only newly-introduced issues. Findings match by the stable
+        ``finding_id``. Omitting ``baseline`` leaves the output byte-identical
+        to before (no ``baselineState`` field).
 
         Differences from the legacy ``_generate_sarif``:
         * ``ruleId`` is derived from ``finding.technique`` → stable slug
@@ -1060,6 +1068,14 @@ class ReportGenerator:
             "LOW": "note",
             "INFO": "note",
         }
+
+        # Index baseline findings (by stable finding_id) for baselineState.
+        baseline_index = {}
+        if baseline:
+            from core.regression import stable_finding_key
+            for bf in (baseline.get("findings") if isinstance(baseline, dict) else None) or []:
+                if isinstance(bf, dict):
+                    baseline_index[stable_finding_key(bf)] = bf
 
         rules = {}   # rule_id → rule_entry (deduped)
         results = []
@@ -1129,6 +1145,15 @@ class ReportGenerator:
                     "group_id": finding.group_id,
                 },
             }
+            if baseline:
+                b = baseline_index.get(finding.finding_id)
+                if b is None:
+                    result_entry["baselineState"] = "new"
+                elif (b.get("severity", "INFO") != finding.severity
+                        or (b.get("confidence", 0.0) or 0.0) != (finding.confidence or 0.0)):
+                    result_entry["baselineState"] = "updated"
+                else:
+                    result_entry["baselineState"] = "unchanged"
             results.append(result_entry)
 
         sarif = {

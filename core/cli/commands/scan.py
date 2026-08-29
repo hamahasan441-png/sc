@@ -72,7 +72,7 @@ def _build_config_from_args(args):
         "cloud_scan", "osint", "fuzzer", "recon", "discovery", "oauth",
         "mfa_bypass", "api_versioning", "dep_confusion", "llm_logic",
         "h2_smuggling", "cache_poisoning", "api_abuse", "deep_scan", "gatebreaker",
-        "firewall_bypass",
+        "firewall_bypass", "tls", "secrets",
         "shield_detect", "real_ip", "passive_recon", "enrich", "chain_detect",
         "exploit_search", "agent_scan", "attack_map"
     ]
@@ -192,6 +192,13 @@ def _build_config_from_args(args):
         "coverage_json": getattr(args, "coverage_json", None),
         "auto_close": getattr(args, "auto_close", False),
         "coverage_budget": getattr(args, "coverage_budget", 100),
+        "diff_baseline": getattr(args, "diff_baseline", None),
+        "diff_json": getattr(args, "diff_json", None),
+        "diff_sarif": getattr(args, "diff_sarif", None),
+        "gate_new_severity": getattr(args, "gate_new_severity", None),
+        "gate_on_coverage_drop": getattr(args, "gate_on_coverage_drop", False),
+        "gate_coverage_tolerance": getattr(args, "gate_coverage_tolerance", 0.0),
+        "gate_junit": getattr(args, "gate_junit", None),
     }
 
     return config

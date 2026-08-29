@@ -92,5 +92,99 @@ class TestAutoClose(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "")
 
 
+class TestRegressionHook(unittest.TestCase):
+    def _engine_with_finding(self, technique="idor"):
+        from core.models import CanonicalFinding
+        eng = _engine(modules={technique: True})
+        _with_surface(eng)
+        f = CanonicalFinding(technique=technique, url="https://demo.test/orders/1",
+                             method="GET", param="id")
+        eng._canonical_findings[f.finding_id] = f
+        return eng
+
+    def test_build_current_report_shape(self):
+        from core.cli.commands.coverage import build_current_report
+        rep = build_current_report(self._engine_with_finding())
+        self.assertIn("findings", rep)
+        self.assertIn("coverage", rep)
+        self.assertTrue(any(f.get("finding_id") for f in rep["findings"]))
+
+    def test_diff_baseline_reports_fixed(self):
+        import json as _json
+        import os
+        import tempfile
+        from core.cli.commands.coverage import build_current_report, apply_post_scan_coverage
+        # baseline had a finding; current engine has none -> FIXED
+        base_eng = self._engine_with_finding()
+        baseline = build_current_report(base_eng)
+        clean_eng = _engine(modules={"idor": True})
+        _with_surface(clean_eng)
+        clean_eng._canonical_findings.clear()
+        with tempfile.TemporaryDirectory() as d:
+            bpath = os.path.join(d, "baseline.json")
+            _json.dump(baseline, open(bpath, "w"))
+            outp = os.path.join(d, "diff.json")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                apply_post_scan_coverage(clean_eng, {"diff_baseline": bpath, "diff_json": outp})
+            self.assertTrue(os.path.exists(outp))
+            diff = _json.load(open(outp))
+            self.assertGreaterEqual(diff["summary"]["fixed"], 1)
+            self.assertIn("Remediation Retest", buf.getvalue())
+
+
+class TestGateHook(unittest.TestCase):
+    def _base_and_engine(self, base_findings, curr_findings):
+        import json as _json, os, tempfile
+        from core.cli.commands.coverage import build_current_report
+        from core.models import CanonicalFinding
+        be = _engine(modules={"sqli": True}); _with_surface(be); be._canonical_findings.clear()
+        for t, u, sev in base_findings:
+            f = CanonicalFinding(technique=t, url=u, method="GET", param="q", severity=sev)
+            be._canonical_findings[f.finding_id] = f
+        baseline = build_current_report(be)
+        ce = _engine(modules={"sqli": True}); _with_surface(ce); ce._canonical_findings.clear()
+        for t, u, sev in curr_findings:
+            f = CanonicalFinding(technique=t, url=u, method="GET", param="q", severity=sev)
+            ce._canonical_findings[f.finding_id] = f
+        d = tempfile.mkdtemp(); bp = os.path.join(d, "base.json")
+        _json.dump(baseline, open(bp, "w"))
+        return bp, ce, d
+
+    def test_gate_passes_no_new(self):
+        bp, ce, _ = self._base_and_engine(
+            [("sqli", "https://demo.test/a", "HIGH")],
+            [("sqli", "https://demo.test/a", "HIGH")])
+        cfg = {"diff_baseline": bp, "gate_new_severity": "HIGH"}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            apply_post_scan_coverage(ce, cfg)  # no SystemExit
+        self.assertIn("PASS", buf.getvalue())
+
+    def test_gate_fails_on_new_high_exits(self):
+        bp, ce, _ = self._base_and_engine(
+            [],
+            [("sqli", "https://demo.test/a", "CRITICAL")])
+        cfg = {"diff_baseline": bp, "gate_new_severity": "HIGH"}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                apply_post_scan_coverage(ce, cfg)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("FAIL", buf.getvalue())
+
+    def test_gate_junit_written(self):
+        import json as _json, os, tempfile
+        bp, ce, d = self._base_and_engine(
+            [], [("sqli", "https://demo.test/a", "LOW")])
+        jpath = os.path.join(d, "gate.xml")
+        cfg = {"diff_baseline": bp, "gate_new_severity": "HIGH", "gate_junit": jpath}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            apply_post_scan_coverage(ce, cfg)  # LOW new, HIGH threshold -> pass
+        self.assertTrue(os.path.exists(jpath))
+        self.assertIn("testsuite", open(jpath).read())
+
+
 if __name__ == "__main__":
     unittest.main()

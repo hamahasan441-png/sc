@@ -56,3 +56,5 @@ def add_module_arguments(parser: argparse.ArgumentParser):
         dest="firewall_bypass",
         help="Network/NGFW/ACL firewall bypass: path ACL, IP allowlist, port/protocol hop, origin-IP, IPv6",
     )
+    g.add_argument("--tls", action="store_true", help="TLS/crypto config checks: cert expiry/hostname, deprecated protocols, weak ciphers, missing HSTS (non-invasive)")
+    g.add_argument("--secrets", action="store_true", help="Secrets exposure scan: API keys, tokens, private keys, high-entropy secrets in responses/JS (masked in report, non-invasive)")

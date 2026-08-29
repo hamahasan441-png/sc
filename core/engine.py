@@ -446,6 +446,11 @@ class AtomicEngine:
             # Firewall Bypass: network / NGFW / ACL (path, IP, port,
             # protocol, origin hop) — complementary to WAF/GateBreaker.
             "firewall_bypass": ("modules.firewall_bypass", "FirewallBypassModule"),
+            # TLS / cryptographic configuration (non-invasive) — closes the
+            # TLS_CRYPTO attack-surface blind spot.
+            "tls": ("modules.tls_scan", "TLSScanModule"),
+            # Secrets exposure (non-invasive) — closes the SECRETS blind spot.
+            "secrets": ("modules.secrets_scan", "SecretsScanModule"),
         }
 
         modules_config = self.config.get("modules", {})

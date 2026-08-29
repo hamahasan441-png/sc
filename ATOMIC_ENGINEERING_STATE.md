@@ -167,6 +167,79 @@ fixtures:
 - The scan JSON report now emits `coverage`, `surface_coverage`,
   `coverage_plan`, and `authz` — the full accounting for an actual run.
 
+### Regression / remediation-retest engine (this session)
+
+`core/regression.py` compares two scan reports of the same target over time —
+the roadmap's REGRESSION COMPARISON / REMEDIATION RETEST:
+
+- `diff_reports(baseline, current)` classifies findings **NEW / FIXED /
+  PERSISTING / CHANGED** (severity or confidence moved) and reports a coverage
+  delta (endpoint coverage %, surface blind spots opened/closed).
+- Findings match by a **stable identity** — the report's `finding_id`, or the
+  same SHA-256 over `(param, payload, technique, url)` that `CanonicalFinding`
+  uses (verified equal in tests) — so legacy and canonical reports diff
+  consistently and the same issue matches across runs regardless of timestamp.
+- CLI: `--diff-baseline PATH` (post-scan) prints a "Remediation Retest"
+  summary and `--diff-json PATH` writes the diff. Verified end-to-end: SQLi
+  FIXED, XSS NEW, IDOR PERSISTING, coverage 100%→66.7%.
+- Pure and deterministic (two report dicts in, one diff out; no I/O). Tests:
+  `tests/test_regression.py` (14) + CLI tests.
+
+### Baseline-aware SARIF (this session)
+
+`ReportGenerator.scan_result_to_canonical_sarif(scan_result, baseline=...)`
+stamps SARIF's native `baselineState` on each result — `new` (not in the
+baseline), `updated` (severity/confidence moved), or `unchanged` — matching by
+the stable `finding_id`. This lets CI code-scanning (e.g. GitHub) surface only
+newly-introduced issues. Omitting `baseline` leaves output byte-identical (the
+32 golden SARIF stability tests still pass). CLI: `--diff-sarif PATH` (with
+`--diff-baseline`). Verified: sqli→unchanged, xss→new. Tests:
+`tests/test_sarif_baseline.py` (6).
+
+### Differential CI gate (this session)
+
+`core/gate.py`'s `evaluate_gate(diff, ...)` turns a regression diff into a
+pass/fail CI verdict — failing only on what *changed*: new findings at/above a
+severity, or a coverage regression. This is what makes the scanner adoptable in
+a pipeline (a PR is blocked for risk it adds, not the backlog it inherited).
+
+- `--gate-new-severity SEV` fails the build if any NEW finding (vs
+  `--diff-baseline`) is at/above SEV; `--gate-on-coverage-drop`
+  (+`--gate-coverage-tolerance`) fails on a coverage regression;
+  `--gate-junit PATH` writes JUnit XML (one testcase per check, XML-escaped).
+- The gate sets a real non-zero process exit code; verified end-to-end: a NEW
+  CRITICAL → "CI gate: FAIL" → exit 1, while a pre-existing finding passes.
+- Pure & deterministic (diff + policy in, verdict out). Tests:
+  `tests/test_gate.py` (15) + CLI gate tests.
+
+### TLS/crypto module — closing a coverage blind spot (this session)
+
+The surface-ledger audit showed two hard blind spots (no module mapped):
+`TLS_CRYPTO` and `SECRETS`. `modules/tls_scan.py` closes the first:
+non-invasive checks for deprecated protocols, weak ciphers, cert expiry,
+hostname mismatch, and missing HSTS. Logic is split into pure `evaluate_*`
+functions (unit-tested, no network) with a thin real-handshake `test_url`
+wrapper that degrades gracefully on connection failure. Registered as the
+`tls` module/`--tls` flag and mapped to `SurfaceCategory.TLS_CRYPTO`, so the
+ledger no longer reports it as an untested blind spot. Tests:
+`tests/test_tls_scan.py` (21). Remaining zero-module blind spot: `SECRETS`.
+
+### Secrets module — zero hard blind spots (this session)
+
+`modules/secrets_scan.py` closes the last hard blind spot (SECRETS):
+non-invasive detection of exposed API keys, cloud credentials, tokens, private
+keys and high-entropy secret assignments in responses and linked same-origin
+JS. Detected values are **always masked** before reaching a finding/report —
+exposure is proven without redistributing the live secret. Detection is a pure
+`detect_secrets(text)` function (entropy-gated generics, placeholder filtering,
+dedup) with a thin `test_url` wrapper. Registered as `secrets`/`--secrets`,
+mapped to `SurfaceCategory.SECRETS`. Tests: `tests/test_secrets_scan.py` (18).
+
+**Coverage audit now: 0 hard blind spots** — all 16 attack-surface categories
+have at least one validator. Remaining depth work is "thin" categories
+(AUTHORIZATION, FILE_HANDLING, CLOUD_PLATFORM, TECH_VERSION, and the two just
+added), not blind spots.
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive
