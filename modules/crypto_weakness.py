@@ -37,6 +37,7 @@ class CryptoWeaknessModule(BaseModule):
         for port in [443, 8443]:
             try:
                 context = ssl.create_default_context()
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
                 with socket.create_connection((hostname, port), timeout=5) as sock:
@@ -65,6 +66,7 @@ class CryptoWeaknessModule(BaseModule):
         for port in [443, 8443]:
             try:
                 context = ssl.create_default_context()
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
                 with socket.create_connection((hostname, port), timeout=5) as sock:
@@ -75,6 +77,7 @@ class CryptoWeaknessModule(BaseModule):
                         # Check for self-signed
                         try:
                             verify_ctx = ssl.create_default_context()
+                            verify_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
                             with socket.create_connection((hostname, port), timeout=5) as vsock:
                                 with verify_ctx.wrap_socket(vsock, server_hostname=hostname) as vcert:
                                     pass
