@@ -69,6 +69,8 @@ MODULE_SURFACE_CATEGORY: Dict[str, str] = {
     "reconnaissance": C.DNS_DOMAIN,
     "osint": C.DNS_DOMAIN,
     "discovery": C.WEB_APP,
+    # TLS / cryptographic configuration
+    "tls": C.TLS_CRYPTO,
     # File handling
     "uploader": C.FILE_HANDLING,
     # Security controls

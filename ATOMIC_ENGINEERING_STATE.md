@@ -212,6 +212,18 @@ a pipeline (a PR is blocked for risk it adds, not the backlog it inherited).
 - Pure & deterministic (diff + policy in, verdict out). Tests:
   `tests/test_gate.py` (15) + CLI gate tests.
 
+### TLS/crypto module — closing a coverage blind spot (this session)
+
+The surface-ledger audit showed two hard blind spots (no module mapped):
+`TLS_CRYPTO` and `SECRETS`. `modules/tls_scan.py` closes the first:
+non-invasive checks for deprecated protocols, weak ciphers, cert expiry,
+hostname mismatch, and missing HSTS. Logic is split into pure `evaluate_*`
+functions (unit-tested, no network) with a thin real-handshake `test_url`
+wrapper that degrades gracefully on connection failure. Registered as the
+`tls` module/`--tls` flag and mapped to `SurfaceCategory.TLS_CRYPTO`, so the
+ledger no longer reports it as an untested blind spot. Tests:
+`tests/test_tls_scan.py` (21). Remaining zero-module blind spot: `SECRETS`.
+
 ### Safety boundary (declined by design)
 
 The spec also asked that Atomic "escalate from scanning into invasive

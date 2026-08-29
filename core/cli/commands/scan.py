@@ -72,7 +72,7 @@ def _build_config_from_args(args):
         "cloud_scan", "osint", "fuzzer", "recon", "discovery", "oauth",
         "mfa_bypass", "api_versioning", "dep_confusion", "llm_logic",
         "h2_smuggling", "cache_poisoning", "api_abuse", "deep_scan", "gatebreaker",
-        "firewall_bypass",
+        "firewall_bypass", "tls",
         "shield_detect", "real_ip", "passive_recon", "enrich", "chain_detect",
         "exploit_search", "agent_scan", "attack_map"
     ]
