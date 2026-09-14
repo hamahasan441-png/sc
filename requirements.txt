@@ -40,7 +40,7 @@ sqlalchemy==2.0.51
 
 # Utilities
 colorama==0.4.6
-tqdm==4.70.0
+tqdm==4.70.1
 
 # DNS resolution
 dnspython==2.8.0
