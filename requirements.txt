@@ -46,7 +46,7 @@ tqdm==4.70.0
 dnspython==2.8.0
 
 # Packet-level network scanning
-scapy==2.7.0
+scapy==2.8.0
 
 # YAML configuration
 PyYAML==6.0.3
